@@ -946,3 +946,195 @@ func TestFIFO_ConcurrencyLimit_CancelledQueuedWaiterReleasesReservation(t *testi
 		t.Fatalf("queue len=%d want 1 after cancel and retry", got)
 	}
 }
+
+// --- serve-mutex groups (settings.fifo.serveMutexGroups) ---
+
+// newFIFOMutex builds a FIFO with serveMutexGroups configured. The plain
+// newFIFO covers the no-groups default.
+func newFIFOMutex(planner Swapper, eff Effects, groups [][]string) *FIFO {
+	return NewFIFO("test", logmon.NewWriter(io.Discard), planner,
+		config.FifoConfig{ServeMutexGroups: groups}, nil, eff)
+}
+
+// TestFIFO_ServeMutex_ReadySiblingParksUntilDrain: b is ready, but a
+// sibling is handling requests, so b's caller parks and is served only
+// when a drains. No swap is involved at all.
+func TestFIFO_ServeMutex_ReadySiblingParksUntilDrain(t *testing.T) {
+	eff := newFakeEffects()
+	eff.states["a"] = process.StateReady
+	eff.states["b"] = process.StateReady
+	s := newFIFOMutex(&stubPlanner{}, eff, [][]string{{"a", "b"}})
+
+	s.OnRequest(req("a")) // fast path, inFlight[a]=1
+	if eff.served("a") != 1 {
+		t.Fatalf("a not served first")
+	}
+
+	s.OnRequest(req("b")) // sibling busy -> park
+	if eff.served("b") != 0 {
+		t.Fatalf("b served while serve-mutex sibling a is serving")
+	}
+	if eff.startsFor("b") != 0 {
+		t.Fatalf("b started a swap while sibling a is serving")
+	}
+
+	s.OnServeDone(ServeDoneEvent{ModelID: "a"}) // a drains -> promoted
+	if eff.served("b") != 1 {
+		t.Fatalf("b not served after sibling a drained")
+	}
+}
+
+// TestFIFO_ServeMutex_WarmSwapHoldsWaiters: a model that is not loaded yet
+// may still warm-swap behind a serving sibling — loading does not serve —
+// but on swap completion its callers stay parked (the model is warm) until
+// the sibling drains.
+func TestFIFO_ServeMutex_WarmSwapHoldsWaiters(t *testing.T) {
+	eff := newFakeEffects()
+	eff.states["a"] = process.StateReady
+	eff.states["b"] = process.StateStopped
+	s := newFIFOMutex(&stubPlanner{}, eff, [][]string{{"a", "b"}})
+
+	s.OnRequest(req("a")) // serving
+	s.OnRequest(req("b")) // not ready, nothing to evict: warm swap proceeds
+	if eff.startsFor("b") != 1 {
+		t.Fatalf("warm swap for b should proceed while sibling a serving")
+	}
+
+	eff.states["b"] = process.StateReady
+	s.OnSwapDone(SwapDone{ModelID: "b"})
+	if eff.served("b") != 0 {
+		t.Fatalf("swap completion served b while sibling a is serving")
+	}
+	if got := len(s.queued); got != 1 {
+		t.Fatalf("queued=%d want 1 re-queued waiter", got)
+	}
+
+	s.OnServeDone(ServeDoneEvent{ModelID: "a"}) // a drains -> drainQueue grants
+	if eff.served("b") != 1 {
+		t.Fatalf("b not served after sibling a drained")
+	}
+}
+
+// TestFIFO_ServeMutex_SwapErrorReleasesWaiters: swap failures always go
+// through; the mutex only holds back serving, never error delivery.
+func TestFIFO_ServeMutex_SwapErrorReleasesWaiters(t *testing.T) {
+	eff := newFakeEffects()
+	eff.states["a"] = process.StateReady
+	eff.states["b"] = process.StateStopped
+	s := newFIFOMutex(&stubPlanner{}, eff, [][]string{{"a", "b"}})
+
+	s.OnRequest(req("a")) // serving
+	s.OnRequest(req("b")) // warm swap
+
+	s.OnSwapDone(SwapDone{ModelID: "b", Err: errors.New("boom")})
+	if eff.errored("b") != 1 {
+		t.Fatalf("swap error must release waiters even with a serving sibling")
+	}
+	if eff.served("b") != 0 {
+		t.Fatalf("b must not serve after failed swap")
+	}
+}
+
+// TestFIFO_ServeMutex_UnrelatedModelServes: models outside the mutex group
+// are untouched — the fast path still serves them next to a busy member.
+func TestFIFO_ServeMutex_UnrelatedModelServes(t *testing.T) {
+	eff := newFakeEffects()
+	for _, id := range []string{"a", "b", "c"} {
+		eff.states[id] = process.StateReady
+	}
+	s := newFIFOMutex(&stubPlanner{}, eff, [][]string{{"a", "b"}})
+
+	s.OnRequest(req("a")) // serving
+	s.OnRequest(req("c")) // c is in no group -> fast path
+	if eff.served("c") != 1 {
+		t.Fatalf("ungrouped c should serve next to busy a")
+	}
+}
+
+// TestFIFO_ServeMutex_PingPongBatches: while a serves, more b requests and
+// a follow-up a request queue up; when a's last request drains, b's whole
+// batch is granted, and the next a request parks again behind serving b.
+// Traffic turns into per-model batches with no swaps.
+func TestFIFO_ServeMutex_PingPongBatches(t *testing.T) {
+	eff := newFakeEffects()
+	eff.states["a"] = process.StateReady
+	eff.states["b"] = process.StateReady
+	s := newFIFOMutex(&stubPlanner{}, eff, [][]string{{"a", "b"}})
+
+	s.OnRequest(req("a"))                       // served (inFlight a=1)
+	s.OnRequest(req("b"))                       // parked
+	s.OnRequest(req("b"))                       // parked
+	s.OnRequest(req("a"))                       // sibling b has nothing in flight -> fast path
+	s.OnServeDone(ServeDoneEvent{ModelID: "a"}) // a=1 still busy
+	if eff.served("b") != 0 {
+		t.Fatalf("b promoted while a still busy")
+	}
+	s.OnServeDone(ServeDoneEvent{ModelID: "a"}) // a drained
+	if eff.served("a") != 2 {
+		t.Fatalf("served a=%d want 2", eff.served("a"))
+	}
+	if eff.served("b") != 2 {
+		t.Fatalf("b batch=%d want 2 after a drained", eff.served("b"))
+	}
+
+	s.OnRequest(req("a")) // parked behind serving b
+	if eff.served("a") != 2 {
+		t.Fatalf("a served again while b batch is in flight")
+	}
+	s.OnServeDone(ServeDoneEvent{ModelID: "b"}) // b=1 still busy
+	s.OnServeDone(ServeDoneEvent{ModelID: "b"}) // b drained
+	if eff.served("a") != 3 {
+		t.Fatalf("a not promoted after b batch drained")
+	}
+}
+
+// TestFIFO_ServeMutex_CancelWhileParked: a parked caller that goes away is
+// pruned and must never be granted when the sibling drains.
+func TestFIFO_ServeMutex_CancelWhileParked(t *testing.T) {
+	eff := newFakeEffects()
+	eff.states["a"] = process.StateReady
+	eff.states["b"] = process.StateReady
+	s := newFIFOMutex(&stubPlanner{}, eff, [][]string{{"a", "b"}})
+
+	s.OnRequest(req("a")) // serving
+	parked := reqCh("b")
+	s.OnRequest(parked) // parked by the mutex
+	s.OnCancel(parked)
+
+	s.OnServeDone(ServeDoneEvent{ModelID: "a"})
+	if eff.served("b") != 0 {
+		t.Fatalf("cancelled parked caller was served")
+	}
+	if got := len(s.queued); got != 0 {
+		t.Fatalf("queued=%d want 0 after cancel", got)
+	}
+}
+
+// TestFIFO_ServeMutex_OverlappingGroupsUnion: a model listed in two groups
+// waits behind the union of their other members, but members that are not
+// each other's siblings may still serve together.
+func TestFIFO_ServeMutex_OverlappingGroupsUnion(t *testing.T) {
+	eff := newFakeEffects()
+	for _, id := range []string{"a", "b", "c"} {
+		eff.states[id] = process.StateReady
+	}
+	s := newFIFOMutex(&stubPlanner{}, eff, [][]string{{"a", "b"}, {"a", "c"}})
+
+	s.OnRequest(req("b")) // served
+	s.OnRequest(req("c")) // b and c are not siblings -> both serve
+	if eff.served("c") != 1 {
+		t.Fatalf("c should serve alongside non-sibling b")
+	}
+	s.OnRequest(req("a")) // a's siblings are {b, c} -> park
+	if eff.served("a") != 0 {
+		t.Fatalf("a served while sibling b serving")
+	}
+	s.OnServeDone(ServeDoneEvent{ModelID: "b"}) // c still busy
+	if eff.served("a") != 0 {
+		t.Fatalf("a promoted while sibling c serving")
+	}
+	s.OnServeDone(ServeDoneEvent{ModelID: "c"}) // last sibling drained
+	if eff.served("a") != 1 {
+		t.Fatalf("a not promoted after both siblings drained")
+	}
+}

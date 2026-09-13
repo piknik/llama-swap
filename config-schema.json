@@ -959,6 +959,16 @@
                                             "additionalProperties": {
                                                 "type": "integer"
                                             }
+                                        },
+                                        "serveMutexGroups": {
+                                            "type": "array",
+                                            "description": "Groups of model IDs that may load together but must never serve at the same time. While one member has requests in flight, requests for the other members wait in the queue until it drains, so a group's traffic is served as one per-model batch at a time without swapping. A model listed in several groups waits behind the union of their other members.",
+                                            "items": {
+                                                "type": "array",
+                                                "items": {
+                                                    "type": "string"
+                                                }
+                                            }
                                         }
                                     },
                                     "additionalProperties": false

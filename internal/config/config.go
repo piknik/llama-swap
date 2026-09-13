@@ -275,6 +275,14 @@ type SchedulerSettings struct {
 
 type FifoConfig struct {
 	Priority map[string]int `yaml:"priority"` // model ID -> priority, default 0
+
+	// ServeMutexGroups lists groups of model IDs whose serving is
+	// serialized. Group members may be loaded together, but while one
+	// member has requests in flight, requests for the other members stay
+	// parked in the scheduler queue until that member drains, so the
+	// group's traffic is served as one per-model batch at a time with no
+	// swapping. See scheduler.FIFO.
+	ServeMutexGroups [][]string `yaml:"serveMutexGroups"`
 }
 
 type RouterConfig struct {

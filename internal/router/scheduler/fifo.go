@@ -32,6 +32,12 @@ type activeSwap struct {
 // A B C A B C --> A A B B C C
 //
 // The strategy is simple and reduces the number of swaps required.
+//
+// When settings.fifo.serveMutexGroups lists groups of model IDs, serving
+// inside each group is serialized: members may load together, but a
+// request for one member waits while a sibling still has requests in
+// flight, so a group's traffic is served as one per-model batch at a
+// time, with no swapping.
 type FIFO struct {
 	name    string
 	logger  *logmon.Monitor
@@ -44,6 +50,11 @@ type FIFO struct {
 	reserved map[string]int
 	inFlight map[string]int
 	queued   []HandlerReq
+
+	// mutexSiblings maps a model ID to the sibling IDs whose serving is
+	// mutually exclusive with it, built from
+	// settings.fifo.serveMutexGroups. Empty when no groups are configured.
+	mutexSiblings map[string]map[string]struct{}
 }
 
 // NewFIFO builds a FIFO scheduler. Per-model concurrency limits are derived
@@ -59,16 +70,34 @@ func NewFIFO(name string, logger *logmon.Monitor, planner Swapper, cfg config.Fi
 		limits[id] = limit
 	}
 
+	var siblings map[string]map[string]struct{}
+	if len(cfg.ServeMutexGroups) > 0 {
+		siblings = make(map[string]map[string]struct{})
+		for _, group := range cfg.ServeMutexGroups {
+			for _, id := range group {
+				if _, ok := siblings[id]; !ok {
+					siblings[id] = make(map[string]struct{})
+				}
+				for _, other := range group {
+					if other != id {
+						siblings[id][other] = struct{}{}
+					}
+				}
+			}
+		}
+	}
+
 	return &FIFO{
-		name:     name,
-		logger:   logger,
-		planner:  planner,
-		cfg:      cfg,
-		effects:  eff,
-		limits:   limits,
-		active:   make(map[string]*activeSwap),
-		reserved: make(map[string]int),
-		inFlight: make(map[string]int),
+		name:          name,
+		logger:        logger,
+		planner:       planner,
+		cfg:           cfg,
+		effects:       eff,
+		limits:        limits,
+		mutexSiblings: siblings,
+		active:        make(map[string]*activeSwap),
+		reserved:      make(map[string]int),
+		inFlight:      make(map[string]int),
 	}
 }
 
@@ -84,7 +113,9 @@ func NewFIFO(name string, logger *logmon.Monitor, planner Swapper, cfg config.Fi
 //     one swap serves all callers that asked for the same model.
 //  3. Fast path — the target process is already ready, the planner sees
 //     nothing to evict, and no in-flight swap is evicting it. Hand back its
-//     ServeHTTP immediately.
+//     ServeHTTP immediately — unless a serve-mutex sibling is handling
+//     requests, in which case the caller parks and OnServeDone retries
+//     when the sibling drains.
 //  4. Would collide with an in-flight swap (we'd stop their target, or they're
 //     stopping us) — park in the queue for OnSwapDone to drain.
 //  5. Would evict a process that is still handling requests — park in the
@@ -116,6 +147,13 @@ func (s *FIFO) OnRequest(req HandlerReq) {
 
 	// (3) Fast path: ready, nothing to evict, and nobody is evicting us.
 	if state == process.StateReady && len(evict) == 0 && !collidesWith(req.Model, evict, s.active) {
+		// (3b) Serve-mutex: a sibling is still handling requests — park
+		// until it drains, the same way rule 5 parks eviction waiters.
+		if s.serveMutexHeld(req.Model) {
+			s.logger.Debugf("%s: queueing request for model %s (serve-mutex sibling is handling requests)", s.name, req.Model)
+			s.enqueue(req)
+			return
+		}
 		s.logger.Debugf("%s: fast-path serving model %s (already ready)", s.name, req.Model)
 		s.grantHandler(req, req.Model)
 		return
@@ -193,10 +231,21 @@ func (s *FIFO) OnSwapDone(ev SwapDone) {
 	}
 	delete(s.active, ev.ModelID)
 
-	for _, w := range sw.waiters {
-		if ev.Err != nil {
+	switch {
+	case ev.Err != nil:
+		for _, w := range sw.waiters {
 			s.grantError(w, ev.Err)
-		} else {
+		}
+	case s.serveMutexHeld(ev.ModelID):
+		// The target is ready, but a serve-mutex sibling is still handling
+		// requests. Keep the callers (the model stays warm): they come
+		// back through drainQueue when the sibling drains.
+		s.logger.Debugf("%s: swap for %s ready, holding %d caller(s) for serve-mutex", s.name, ev.ModelID, len(sw.waiters))
+		for _, w := range sw.waiters {
+			s.enqueue(w)
+		}
+	default:
+		for _, w := range sw.waiters {
 			s.grantHandler(w, ev.ModelID)
 		}
 	}
@@ -421,6 +470,10 @@ func (s *FIFO) drainQueue() {
 		running := s.runningSet(req.Model)
 		evict := s.planner.EvictionFor(req.Model, running)
 		if state == process.StateReady && len(evict) == 0 && !collidesWith(req.Model, evict, s.active) {
+			if s.serveMutexHeld(req.Model) {
+				remaining = append(remaining, req)
+				continue
+			}
 			s.logger.Debugf("%s: queued request for model %s now served fast-path", s.name, req.Model)
 			s.grantHandler(req, req.Model)
 			continue
@@ -507,6 +560,24 @@ func collidesWith(target string, evict []string, active map[string]*activeSwap) 
 func slicesOverlap(xs, ys []string) bool {
 	for _, x := range xs {
 		if containsString(ys, x) {
+			return true
+		}
+	}
+	return false
+}
+
+// serveMutexHeld reports whether any serve-mutex sibling of model is
+// currently handling requests. Siblings come from
+// settings.fifo.serveMutexGroups: members may load together but must never
+// serve together, so requests are parked while a sibling is in flight and
+// the group's traffic flows as one per-model batch at a time. A model in
+// several groups waits behind the union of their other members.
+func (s *FIFO) serveMutexHeld(model string) bool {
+	if len(s.mutexSiblings) == 0 {
+		return false
+	}
+	for sibling := range s.mutexSiblings[model] {
+		if s.inFlight[sibling] > 0 {
 			return true
 		}
 	}
