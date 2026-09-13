@@ -1894,3 +1894,48 @@ routing:
 	require.NoError(t, err)
 	assert.Equal(t, 5, cfg.Routing.Scheduler.Settings.Fifo.Priority["gemma"])
 }
+
+func TestConfig_Routing_ServeMutexGroups(t *testing.T) {
+	yaml := twoModels + `
+routing:
+  scheduler:
+    settings:
+      fifo:
+        serveMutexGroups:
+          - [qwen, gemma, gemma]
+          - [gemma, qwen]
+`
+	cfg, err := LoadConfigFromReader(strings.NewReader(yaml))
+	require.NoError(t, err)
+	// Members are deduped and kept in first-seen order.
+	assert.Equal(t, [][]string{{"qwen", "gemma"}, {"gemma", "qwen"}},
+		cfg.Routing.Scheduler.Settings.Fifo.ServeMutexGroups)
+}
+
+func TestConfig_Routing_ServeMutexGroupsUnknownModel(t *testing.T) {
+	yaml := twoModels + `
+routing:
+  scheduler:
+    settings:
+      fifo:
+        serveMutexGroups:
+          - [gemma, nope]
+`
+	_, err := LoadConfigFromReader(strings.NewReader(yaml))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "serveMutexGroups references unknown model")
+}
+
+func TestConfig_Routing_ServeMutexGroupsNeedTwoMembers(t *testing.T) {
+	yaml := twoModels + `
+routing:
+  scheduler:
+    settings:
+      fifo:
+        serveMutexGroups:
+          - [gemma, gemma]
+`
+	_, err := LoadConfigFromReader(strings.NewReader(yaml))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "at least two distinct models")
+}

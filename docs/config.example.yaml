@@ -707,6 +707,18 @@ routing:
           B: 5
           C: 5
           D: 1
+        # serveMutexGroups: groups of models that may load together but must
+        # never serve at the same time. While one member has requests in
+        # flight, requests for the other members wait in the queue until it
+        # drains, so the group's traffic is served as one per-model batch at
+        # a time with no swapping. Names resolve like any other model
+        # reference (model ID or alias); each group needs at least two
+        # distinct models. A model listed in several groups waits behind the
+        # union of their other members.
+        # - optional, default: no groups
+        # serveMutexGroups:
+        #   - [A, B]
+        #   - [C, D]
 
 # peers: a dictionary of remote peers and models they provide
 # - optional, default empty dictionary

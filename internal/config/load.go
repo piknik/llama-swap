@@ -270,6 +270,29 @@ func LoadConfigFromReader(r io.Reader) (Config, error) {
 			return Config{}, fmt.Errorf("routing.scheduler.settings.fifo.priority references unknown model %q", modelID)
 		}
 	}
+	if groups := config.Routing.Scheduler.Settings.Fifo.ServeMutexGroups; len(groups) > 0 {
+		normalized := make([][]string, 0, len(groups))
+		for i, group := range groups {
+			var members []string
+			seen := make(map[string]bool)
+			for _, name := range group {
+				real, found := config.RealModelName(strings.TrimSpace(name))
+				if !found {
+					return Config{}, fmt.Errorf("routing.scheduler.settings.fifo.serveMutexGroups references unknown model %q", name)
+				}
+				if seen[real] {
+					continue
+				}
+				seen[real] = true
+				members = append(members, real)
+			}
+			if len(members) < 2 {
+				return Config{}, fmt.Errorf("routing.scheduler.settings.fifo.serveMutexGroups group %d must list at least two distinct models", i+1)
+			}
+			normalized = append(normalized, members)
+		}
+		config.Routing.Scheduler.Settings.Fifo.ServeMutexGroups = normalized
+	}
 
 	// Clean up hooks preload
 	if len(config.Hooks.OnStartup.Preload) > 0 {

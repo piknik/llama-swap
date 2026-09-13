@@ -1,10 +1,10 @@
 ---
 title: Routing capacity and request queues
-summary: Configure concurrencyLimit and globalConcurrencyLimit, and understand queued work while a model is loading or busy.
+summary: Queue behavior, concurrency limits, and serializing service between co-resident models with serveMutexGroups.
 category: guides
-tags: [routing, queue, capacity, concurrency, concurrency-limit, max-concurrent-requests, global-concurrency-limit, rate-limit]
-config_keys: [routing, models.*.concurrencyLimit, globalConcurrencyLimit]
-updated: 2026-09-10
+tags: [routing, queue, capacity, concurrency, concurrency-limit, max-concurrent-requests, global-concurrency-limit, rate-limit, serve-mutex, batching]
+config_keys: [routing, models.*.concurrencyLimit, globalConcurrencyLimit, routing.scheduler.settings.fifo.serveMutexGroups]
+updated: 2026-09-13
 ---
 
 # Routing capacity and request queues
@@ -42,3 +42,47 @@ Use this to protect shared hardware (CPU, disk, network) from being
 overwhelmed by traffic spread across many different models, which a per-model
 `concurrencyLimit` cannot do since it only counts requests to one model at a
 time.
+
+## One model at a time: serve-mutex groups
+
+`routing.scheduler.settings.fifo.serveMutexGroups` serializes *serving*
+between models that are allowed to stay loaded together. Each group lists
+model IDs; while one member has requests in flight, requests for the other
+members wait in the queue and are promoted when that member drains — traffic
+flows as per-model batches, and nothing unloads.
+
+```yaml
+routing:
+  router:
+    use: matrix
+    settings:
+      matrix:
+        sets:
+          resident: "chat-model & embed-model"   # allowed to coexist
+  scheduler:
+    settings:
+      fifo:
+        serveMutexGroups:
+          - [chat-model, embed-model]            # but never served together
+```
+
+This fits hardware where keeping several models resident is cheap (weights
+offloaded to system RAM, one discrete GPU): serving them at the same time
+splits VRAM across their KV caches and slows both, while swapping them would
+wipe caches and pay a cold start. The mutex keeps each model's cache warm
+between its turns and reserves swapping for models that truly cannot share
+the card.
+
+Notes:
+
+- Models in no group, and models of different groups, are untouched: they
+  serve as soon as the router grants them.
+- Inside a group only one model serves at a time, and a long stream holds
+  the whole group for its duration; that is the intended trade. A model in
+  several groups merges them: every member waits behind every other.
+- `models.*.concurrencyLimit` still caps per-model parallelism within a
+  turn, and `fifo.priority` still orders parked requests — follow-up
+  requests can cut in front of a lower-priority sibling's waiting batch
+  (see `guides/routing/groups-and-matrix`).
+- Groups take model IDs or aliases, need at least two distinct models, and
+  an unknown ID fails the config load.
