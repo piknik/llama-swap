@@ -1021,6 +1021,18 @@ func newFIFOMutex(planner Swapper, eff Effects, groups [][]string) *FIFO {
 		config.FifoConfig{ServeMutexGroups: groups}, nil, eff)
 }
 
+// swapDoneFor builds the completion event the scheduler expects for modelID's
+// in-flight swap. Upstream v272 made swaps carry a generation that OnSwapDone
+// matches against, so a bare SwapDone{ModelID: ...} (generation 0) is silently
+// dropped — these tests must report the generation the FIFO assigned.
+func swapDoneFor(s *FIFO, modelID string, err error) SwapDone {
+	sw, ok := s.active[modelID]
+	if !ok {
+		panic("swapDoneFor: no active swap for " + modelID)
+	}
+	return SwapDone{ModelID: modelID, Generation: sw.generation, Err: err}
+}
+
 // TestFIFO_ServeMutex_ReadySiblingParksUntilDrain: b is ready, but a
 // sibling is handling requests, so b's caller parks and is served only
 // when a drains. No swap is involved at all.
@@ -1066,7 +1078,7 @@ func TestFIFO_ServeMutex_WarmSwapHoldsWaiters(t *testing.T) {
 	}
 
 	eff.states["b"] = process.StateReady
-	s.OnSwapDone(SwapDone{ModelID: "b"})
+	s.OnSwapDone(swapDoneFor(s, "b", nil))
 	if eff.served("b") != 0 {
 		t.Fatalf("swap completion served b while sibling a is serving")
 	}
@@ -1091,7 +1103,7 @@ func TestFIFO_ServeMutex_SwapErrorReleasesWaiters(t *testing.T) {
 	s.OnRequest(req("a")) // serving
 	s.OnRequest(req("b")) // warm swap
 
-	s.OnSwapDone(SwapDone{ModelID: "b", Err: errors.New("boom")})
+	s.OnSwapDone(swapDoneFor(s, "b", errors.New("boom")))
 	if eff.errored("b") != 1 {
 		t.Fatalf("swap error must release waiters even with a serving sibling")
 	}
