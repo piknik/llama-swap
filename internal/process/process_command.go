@@ -135,6 +135,13 @@ type ProcessCommand struct {
 	// Written only by run(); read by ServeHTTP via atomic load.
 	handler atomic.Pointer[http.HandlerFunc]
 
+	// adoptedProxy is the configured proxy that startup adoption replaced, kept so
+	// it can be put back. An adopted engine whose wake fails, or that gets
+	// destroyed, must not leave this process addressing a container that is gone —
+	// every later start would then health-check a dead address. Written only by
+	// run(); adoptParked and restoreAdoptedProxy both run on that goroutine.
+	adoptedProxy string
+
 	// lastUse is the unix-nano timestamp of the most recent activity baseline.
 	// It is initialized when the process becomes Ready and updated after ServeHTTP completes.
 	lastUse  atomic.Int64
@@ -235,6 +242,10 @@ func (p *ProcessCommand) run() {
 		cmdDone      <-chan struct{}
 		cmdCancel    context.CancelFunc
 		readyWaiters []waitReadyReq
+		// adopted records whether startup adoption has already been asked about.
+		// Detection runs at most once per process instance: if an adopted engine
+		// fails to wake, re-detecting would adopt it again into the same failure.
+		adopted bool
 		// runResp parks the in-flight Run caller's response channel. The
 		// interface contract is that Run blocks until the process is
 		// terminated, so we hold this until Stop, parentCtx, or an
@@ -356,6 +367,26 @@ func (p *ProcessCommand) run() {
 				req.respond <- fmt.Errorf("[%s] could not be started in %s state", p.id, state)
 				continue
 			}
+			// Adoption. A container parked by the *previous* llama-swap instance is
+			// invisible to this one: it tracks no process, so the model reads stopped
+			// and the first request would cold-load, throwing away the parked engine
+			// (and, on a container-backed entry, losing the name race with the stale
+			// container's teardown). Ask once, lazily, from StateStopped only: a
+			// detection probe is read-only, and doing it here — rather than in New()
+			// or config load — keeps the decision inside the state machine that owns
+			// it, like every other start decision (issue #946).
+			if state == StateStopped && !adopted {
+				adopted = true
+				if p.adoptParked() {
+					setStateParked(StateParked, time.Now())
+					waking = true
+					// parkTTL applies to an adopted model too: it is holding host RAM
+					// this instance cannot see, and parkTTL is what hands it back.
+					if p.config.ParkTTL > 0 {
+						go p.runParkTTL(time.Now(), time.Duration(p.config.ParkTTL)*time.Second)
+					}
+				}
+			}
 
 			startTimeout := req.timeout
 			if waking {
@@ -447,7 +478,10 @@ func (p *ProcessCommand) run() {
 					if waking {
 						// A failed wake means the container it parked in is not usable:
 						// record stopped so the next request cold-loads instead of waiting
-						// on a phantom.
+						// on a phantom. An *adopted* engine also has to give back the proxy
+						// this instance allocated, or the cold load would check a dead
+						// address.
+						p.restoreAdoptedProxy()
 						p.proxyLogger.Warnf("<%s> wake failed, the next request will cold-load: %v", p.id, res.err)
 					}
 				}

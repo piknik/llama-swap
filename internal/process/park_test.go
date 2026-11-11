@@ -5,11 +5,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -203,9 +205,201 @@ func waitForMarker(t *testing.T, path string) {
 	t.Fatalf("%s was never written", path)
 }
 
+// detectStateCmd writes a park.detect script that answers with the fake engine's
+// current state. A real park.detect script inspects the deployment's containers
+// and asks the engine its own status endpoint; what matters to llama-swap is the
+// one-object contract, so this emits that contract instead of a Docker-shaped fake.
+func (e *parkTestEngine) detectStateCmd() string {
+	e.t.Helper()
+
+	body := fmt.Sprintf(`{"parked":true,"proxy":"%s"}`, e.srv.URL)
+	return e.writeDetectCmd(fmt.Sprintf("if [ -f %s ]; then printf %s; fi",
+		strconv.Quote(e.parkedFile()), strconv.Quote(body)))
+}
+
+// detectFixedCmd writes a park.detect script that always answers with body, for
+// asserting what adoption does with answers it must not trust.
+func (e *parkTestEngine) detectFixedCmd(body string) string {
+	e.t.Helper()
+
+	return e.writeDetectCmd(fmt.Sprintf("printf %s", strconv.Quote(body)))
+}
+
+func (e *parkTestEngine) writeDetectCmd(line string) string {
+	e.t.Helper()
+
+	path := filepath.Join(e.dir, "detect.sh")
+	script := "#!/bin/sh\n" + line + "\n"
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		e.t.Fatalf("write park.detect script: %v", err)
+	}
+	return path
+}
+
+// proxiedBody issues a request through the process's own reverse proxy and returns
+// what the upstream answered. It is how the adoption tests prove which address the
+// proxy actually dials.
+func proxiedBody(t *testing.T, p *ProcessCommand, path string) (int, string) {
+	t.Helper()
+
+	srv := httptest.NewServer(p)
+	t.Cleanup(srv.Close)
+
+	resp, err := http.Get(srv.URL + path)
+	if err != nil {
+		t.Fatalf("proxied request: %v", err)
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	return resp.StatusCode, string(body)
+}
+
+// TestProcessCommand_AdoptsAParkedEngineAtStartup is the fork-side half of
+// pending/64: a container parked by a *previous* llama-swap instance (gateway
+// restart, config reload) must be woken rather than cold-replaced. The configured
+// proxy is an address nothing listens on, the stand-in for "the port this instance
+// allocated, which the parked container does not bind", so the model only becomes
+// ready if adoption replaced the proxy with the one the parked engine reported, and
+// only proves it woke rather than re-ran if it went through the wake path.
+func TestProcessCommand_AdoptsAParkedEngineAtStartup(t *testing.T) {
+	e := newParkTestEngine(t)
+	// The engine was parked by whatever was running before this llama-swap started.
+	e.setParked(true)
+
+	cfg := parkTestConfig(t, e)
+	cfg.Park.Detect = e.detectStateCmd()
+	cfg.Proxy = "http://127.0.0.1:1"
+
+	p := newProcessCommand(t, cfg)
+	defer func() {
+		if p.State() == StateReady {
+			p.Destroy(testStopTimeout)
+		}
+	}()
+
+	if err := p.EnsureReady(context.Background(), testStartTimeout); err != nil {
+		t.Fatalf("EnsureReady on a parked engine: expected nil, got %v", err)
+	}
+	if got := p.State(); got != StateReady {
+		t.Fatalf("state is %s, want ready", got)
+	}
+	if e.wakeCalls() == 0 {
+		t.Error("adopted model never reached the wake path: adoption did not record it parked")
+	}
+	if !engineIsUp(t, e) {
+		t.Error("adoption destroyed the parked engine instead of waking it")
+	}
+	if e.isParked() {
+		t.Error("the engine still reports parked after the model became ready")
+	}
+
+	// The proxied request must reach the adopted engine, not the configured address.
+	code, body := proxiedBody(t, p, "/health")
+	if code != http.StatusOK || body != "ok" {
+		t.Errorf("proxied /health through the adopted proxy: got %d %q, want 200 ok", code, body)
+	}
+}
+
+// TestProcessCommand_AdoptionSkippedWhenNothingIsParked is the common case: no
+// parked container, so park.detect answers nothing and the model cold-loads exactly
+// as it does without the key armed.
+func TestProcessCommand_AdoptionSkippedWhenNothingIsParked(t *testing.T) {
+	e := newParkTestEngine(t)
+
+	cfg := parkTestConfig(t, e)
+	cfg.Park.Detect = e.detectStateCmd()
+
+	p := newProcessCommand(t, cfg)
+	defer func() {
+		if p.State() == StateReady {
+			p.Destroy(testStopTimeout)
+		}
+	}()
+
+	if err := p.EnsureReady(context.Background(), testStartTimeout); err != nil {
+		t.Fatalf("EnsureReady: expected nil, got %v", err)
+	}
+	if got := p.State(); got != StateReady {
+		t.Fatalf("state is %s, want ready", got)
+	}
+	if n := e.wakeCalls(); n != 0 {
+		t.Errorf("wake calls = %d, want 0: a cold start must not be counted as a wake", n)
+	}
+}
+
+// TestProcessCommand_AdoptionRefusesAnAwakeEngine: a container that answers awake
+// is deliberately not adopted. Adopting it would leave llama-swap tracking nothing
+// while a container it cannot stop holds the engine name, and the next cold run
+// would lose that race — the exact failure adoption exists to prevent.
+func TestProcessCommand_AdoptionRefusesAnAwakeEngine(t *testing.T) {
+	e := newParkTestEngine(t)
+
+	cfg := parkTestConfig(t, e)
+	cfg.Park.Detect = e.detectFixedCmd(`{"parked":false,"busy":true}`)
+
+	p := newProcessCommand(t, cfg)
+	defer func() {
+		if p.State() == StateReady {
+			p.Destroy(testStopTimeout)
+		}
+	}()
+
+	if err := p.EnsureReady(context.Background(), testStartTimeout); err != nil {
+		t.Fatalf("EnsureReady: expected nil, got %v", err)
+	}
+	if n := e.wakeCalls(); n != 0 {
+		t.Errorf("wake calls = %d, want 0: an awake engine must not be adopted", n)
+	}
+}
+
+// TestProcessCommand_AdoptionRefusesAnUnusableAdoption: park.detect is operator
+// script, so its answer is not trusted. A parked answer that does not name a usable
+// engine URL must be refused rather than installed as the proxy — otherwise a broken
+// script could point the gateway's traffic at an arbitrary host.
+func TestProcessCommand_AdoptionRefusesAnUnusableAdoption(t *testing.T) {
+	bodies := []string{
+		`{"parked":true}`,
+		`{"parked":true,"proxy":""}`,
+		`{"parked":true,"proxy":"not-a-url"}`,
+		`{"parked":true,"proxy":"ftp://engine:21"}`,
+		`not json at all`,
+	}
+
+	for i, body := range bodies {
+		t.Run(fmt.Sprintf("detect output %d", i), func(t *testing.T) {
+			e := newParkTestEngine(t)
+
+			cfg := parkTestConfig(t, e)
+			cfg.Park.Detect = e.detectFixedCmd(body)
+
+			p := newProcessCommand(t, cfg)
+			defer func() {
+				if p.State() == StateReady {
+					p.Destroy(testStopTimeout)
+				}
+			}()
+
+			if err := p.EnsureReady(context.Background(), testStartTimeout); err != nil {
+				t.Fatalf("EnsureReady: expected nil, got %v (a refused adoption must fall back to a cold start)", err)
+			}
+			if n := e.wakeCalls(); n != 0 {
+				t.Errorf("wake calls = %d, want 0 for park.detect output %q", n, body)
+			}
+			// Traffic still reaches the configured proxy, which is the proof that a
+			// refused adoption installed nothing.
+			code, got := proxiedBody(t, p, "/health")
+			if code != http.StatusOK || got != "ok" {
+				t.Errorf("proxied /health: got %d %q, want 200 ok", code, got)
+			}
+		})
+	}
+}
+
 // TestProcessCommand_ParkKeepsTheEngineUp is the core claim of parking: llama-swap
 // releases the process it tracks and the engine is still there, so the next
 // request re-attaches instead of cold-loading.
+
 func TestProcessCommand_ParkKeepsTheEngineUp(t *testing.T) {
 	e := newParkTestEngine(t)
 	p := newProcessCommand(t, parkTestConfig(t, e))
@@ -592,4 +786,105 @@ func serveThrough(p *ProcessCommand, path string) *httptest.ResponseRecorder {
 	req := httptest.NewRequest("GET", path, nil)
 	p.ServeHTTP(rr, req)
 	return rr
+}
+
+// TestProcessCommand_AdoptionProxyIsRestoredWhenTheWakeFails is the failure mode
+// adoption introduces: the reported engine address replaces the configured one, so
+// if that engine never passes the readiness gate (the container is up but the engine
+// inside it is not) the process must give the configured address back. Left
+// overridden, every later start would health-check a dead address and the entry
+// could never come back.
+func TestProcessCommand_AdoptionProxyIsRestoredWhenTheWakeFails(t *testing.T) {
+	e := newParkTestEngine(t)
+	e.setParked(true)
+
+	// A parked container whose engine no longer answers the health check.
+	unready := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	t.Cleanup(unready.Close)
+
+	cfg := parkTestConfig(t, e)
+	cfg.Park.Detect = e.detectFixedCmd(fmt.Sprintf(`{"parked":true,"proxy":"%s"}`, unready.URL))
+	cfg.HealthCheckTimeout = 2
+
+	p := newProcessCommand(t, cfg)
+	defer func() {
+		if p.State() == StateReady {
+			p.Destroy(testStopTimeout)
+		}
+	}()
+
+	if err := p.EnsureReady(context.Background(), testStartTimeout); err == nil {
+		t.Fatal("EnsureReady against an engine that never passes the gate: expected an error, got nil")
+	}
+	if got := p.State(); got != StateStopped {
+		t.Fatalf("state after a failed adopted wake is %s, want stopped", got)
+	}
+
+	// The cold load that follows has to address the engine this instance starts,
+	// which is the configured proxy — proved by the body the fake engine returns.
+	if err := p.EnsureReady(context.Background(), testStartTimeout); err != nil {
+		t.Fatalf("EnsureReady for the cold load after the failed wake: %v", err)
+	}
+	if code, body := proxiedBody(t, p, "/health"); code != http.StatusOK || body != "ok" {
+		t.Errorf("proxied /health after the failed adopted wake: got %d %q, want 200 ok from the configured engine", code, body)
+	}
+}
+
+// TestProcessCommand_AdoptedProxyIsRestoredOnDestroy covers the other way an
+// adopted engine ends: parked on purpose, then destroyed. Both a failed wake and a
+// destroy mean the next start comes through cmd on the configured address, so the
+// adopted address must not survive either of them.
+func TestProcessCommand_AdoptedProxyIsRestoredOnDestroy(t *testing.T) {
+	e := newParkTestEngine(t)
+	e.setParked(true)
+
+	adopted := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, "adopted")
+	}))
+	t.Cleanup(adopted.Close)
+
+	cfg := parkTestConfig(t, e)
+	cfg.Park.Detect = e.detectFixedCmd(fmt.Sprintf(`{"parked":true,"proxy":"%s"}`, adopted.URL))
+	// No status endpoint: the park is confirmed by the command having run, so this
+	// test does not need the stand-in engine to implement /v1/sleep.
+	cfg.Park.StatusEndpoint = ""
+
+	p := newProcessCommand(t, cfg)
+	defer func() {
+		if p.State() == StateReady {
+			p.Destroy(testStopTimeout)
+		}
+	}()
+
+	if err := p.EnsureReady(context.Background(), testStartTimeout); err != nil {
+		t.Fatalf("EnsureReady on the adopted engine: %v", err)
+	}
+	if code, body := proxiedBody(t, p, "/health"); code != http.StatusOK || body != "adopted" {
+		t.Fatalf("proxied /health while adopted: got %d %q, want 200 adopted", code, body)
+	}
+
+	if err := p.Park(context.Background(), 0); err != nil {
+		t.Fatalf("Park on the adopted model: %v", err)
+	}
+	if got := p.State(); got != StateParked {
+		t.Fatalf("state after parking the adopted model is %s, want parked", got)
+	}
+	if err := p.Destroy(testStopTimeout); err != nil {
+		t.Fatalf("Destroy on the parked adopted model: %v", err)
+	}
+	if got := p.State(); got != StateStopped {
+		t.Fatalf("state after destroy is %s, want stopped", got)
+	}
+	if !readMarker(e.destroyedFile()) {
+		t.Error("cmdDestroy did not run for the parked adopted model")
+	}
+
+	if err := p.EnsureReady(context.Background(), testStartTimeout); err != nil {
+		t.Fatalf("EnsureReady for the cold load after destroy: %v", err)
+	}
+	if code, body := proxiedBody(t, p, "/health"); code != http.StatusOK || body != "ok" {
+		t.Errorf("proxied /health after destroy: got %d %q, want 200 ok from the configured engine", code, body)
+	}
 }

@@ -3,7 +3,7 @@ title: Parking a model instead of unloading it
 summary: park, parkTTL and cmdDestroy split "release the device" from "throw the model away", so an idle model keeps its container and host-side state and wakes in seconds.
 category: guides
 tags: [park, sleep, wake, ttl, unload, cmd-stop, destroy, docker, vram, memory, container]
-config_keys: [models.*.park, models.*.park.cmd, models.*.park.parkTimeout, models.*.park.wakeTimeout, models.*.park.statusEndpoint, models.*.park.parkedField, models.*.park.wakeEndpoint, models.*.park.confirmTimeout, models.*.cmdDestroy, models.*.parkTTL, models.*.port]
+config_keys: [models.*.park, models.*.park.cmd, models.*.park.parkTimeout, models.*.park.wakeTimeout, models.*.park.statusEndpoint, models.*.park.parkedField, models.*.park.wakeEndpoint, models.*.park.confirmTimeout, models.*.park.detect, models.*.cmdDestroy, models.*.parkTTL, models.*.port]
 updated: 2026-11-11
 ---
 
@@ -151,6 +151,80 @@ model big-moe port: pinned but cmd does not use ${PORT}
 
 Pin every model you intend to park.
 
+## `park.detect` — adopting a parked engine that outlived llama-swap
+
+Parking keeps a container that llama-swap no longer tracks, and llama-swap's
+knowledge of it lives only in the process it started. So anything that recycles
+llama-swap itself — an orchestrator restart, a config reload — leaves the container
+parked and the model **stopped**. The next request then cold-loads it, throwing away
+the exact thing parking was for, and on a container-backed entry the fresh
+`docker run` collides with the stale container's name.
+
+`park.detect` is how one model opts back in. Before this instance's first start of
+the model, the command runs **once** and must print one JSON object on stdout within
+5 s:
+
+```yaml
+models:
+  big-moe:
+    port: 5801
+    # A note goes above the key: YAML folds a `#` line placed inside the scalar into
+    # that scalar's first line, and the result loads as "empty command".
+    park:
+      # the script inspects the container, confirms it belongs to this entry,
+      # asks the engine on the port the container recorded, and prints the
+      # object above when all of that holds
+      detect: /models/.pcni/park-detect.sh ${MODEL_ID}
+```
+
+- `{"parked":true,"proxy":"http://host:port"}` ⇒ **adopted**. The reported proxy
+  replaces this process's upstream for the readiness gate, `wakeEndpoint` and
+  proxied traffic — which is how an engine bound to a port this instance would not
+  have allocated still gets woken rather than replaced. The model is recorded
+  `parked` at once, so the wake path (`cmd`, `wakeEndpoint`, `wakeTimeout`,
+  `parkTTL`) is the ordinary one.
+- Anything else ⇒ **nothing to adopt**: empty stdout, `{"parked":false}`, a non-zero
+  exit, output that is not that JSON, or a proxy that is not a usable http(s) URL.
+  The model cold-loads through the configured proxy.
+
+An engine that answers **awake** is deliberately not adopted. Adopting a live engine
+would leave llama-swap tracking nothing while a container it cannot stop holds the
+name, and the next cold start would lose that race — the failure adoption exists to
+prevent.
+
+The script is a deployment artifact: llama-swap calls no Docker API anywhere, so
+only the deployment knows how its containers are named, and detection stays a
+command like `cmdStop`. `${MODEL_ID}` and `${PORT}` are substituted at load, and
+`${PID}` is **not** available — there is no process yet, that is the whole point.
+
+What the script must prove is that this is *this entry's* engine, and which address
+it answers on. A container name alone is not evidence: adopt on a name and you can
+hand an entry another entry's engine. And a probe of an engine's park-state route is
+a decision the deployment has to make knowingly — on some engines `GET` on a sleep
+route is not a read, and read-only state routes can wait on an in-progress load.
+`park-detect.sh` in the ca4 deployment's `scripts/` is that decision recorded:
+container up, this entry's own fingerprint pair present on the container, engine
+answering `GET /health` on the recorded port within 2 s, and an optional
+`"<field>": true` gate only for engines whose GET is verified read-only.
+
+Detection runs at most once per process instance, lazily, and only from `stopped`. A
+parked engine that fails to wake is therefore not re-detected: `cmd` is what
+re-attaches it, and adopting the same engine twice into the same failure would be a
+loop. A config reload makes a new process instance, which asks again.
+Two consequences of the override, both worth knowing:
+
+- **`cmd` and the adopted address have to agree, so pin `port:`.** The adopted proxy
+  is what the readiness gate and the reverse proxy use, but `cmd` is still the
+  command the wake runs, and a container-backed `cmd` decides between *attach* and
+  *replace* from the address it stamps into the container. If this instance allocated
+  a different port, `cmd` takes the replace branch, destroys the engine adoption just
+  discovered, and cold-loads — the correct-but-useless fallback. A pinned port makes
+  them agree (`port:` above).
+- **`p.config.Proxy` is restored when an adopted engine does not work out.** A wake
+  that never passes the gate, or a `Destroy` of the parked one, puts the configured
+  address back, so the following cold start health-checks the engine `cmd` starts
+  rather than an address that no longer exists.
+
 ## What llama-swap can see
 
 `parked` and `parking` are process states now, and they mean different things to
@@ -198,6 +272,9 @@ Built and tested here:
   cannot orphan a parked container and make the next start lose the name race
 - pinned ports, including a parked model being destroyed by `cmdDestroy`
 - the `POST /api/models/park/{model}` and `POST /api/models/unpark/{model}` verbs
+- **`park.detect`**, which adopts a parked container llama-swap lost track of: an
+  engine outliving an orchestrator restart or a config reload is woken through the
+  normal path instead of cold-replaced
 
 Not built yet:
 
@@ -205,12 +282,12 @@ Not built yet:
   resident with at most one awake — are Phase 2. Today the router treats a parked
   model as absent when it picks evictions and never wakes one instead of cold
   starting one.
-- **adopting a parked container across a llama-swap restart.** A parked engine that
-  llama-swap lost track of — orchestrator restart, config reload, a `cmd` whose
-  fingerprint changed — is not discovered and re-adopted. `port:` removes the
-  commonest cause (the port no longer renumbers on each wake), but the next engine
-  start still collides with the orphaned container's name. Until adoption lands,
-  that is the failure mode to expect after a gateway restart.
+- **adopting a parked container across a llama-swap restart.** Built, but **not
+  armed anywhere yet**: `park.detect` has to be declared per model and its detection
+  script written by the deployment. Until it is armed, the failure mode to expect
+  after a gateway restart is a cold replace of the parked container. `port:` removes
+  the commonest cause (the port no longer renumbers on each wake), but on its own it
+  does not discover the container.
 - **a UI control.** The two endpoints are the only surface.
 
 ## See also

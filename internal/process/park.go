@@ -1,6 +1,7 @@
 package process
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -326,6 +327,134 @@ func (p *ProcessCommand) parkUpstream(cmd *exec.Cmd) error {
 	return runErr
 }
 
+// adoptParked asks `park.detect` whether an engine this llama-swap instance does
+// not know about is already up and parked, and adopts it when it says so. It is
+// what makes a gateway restart safe for a parked entry: the container outlives
+// llama-swap, but llama-swap's knowledge of it does not, so without adoption the
+// first request cold-replaces an engine that was ready to wake in seconds — and
+// the replacement loses the container-name race.
+//
+// Detection is a command, not a Docker call. llama-swap calls no Docker API
+// anywhere (the lifecycle is all `docker` CLI through cmd/cmdStop), and only the
+// deployment knows how its containers are named, so the script does the looking
+// and answers one JSON object on stdout:
+//
+//	{"parked":true,"proxy":"http://llama-swap_<id>:<port>"}
+//
+// The reported proxy overrides p.config.Proxy for this process, which is what the
+// readiness gate, the wake endpoint and the reverse proxy are all built from — that
+// is how an engine bound to a port this instance would not have allocated can
+// still be woken rather than replaced.
+//
+// Anything else means "nothing to adopt", including an awake engine: adopting a
+// live engine as parked would leave llama-swap tracking nothing while a container
+// it cannot stop holds the name.
+func (p *ProcessCommand) adoptParked() bool {
+	cmdStr := p.config.DetectCommand()
+	if cmdStr == "" {
+		return false
+	}
+
+	args, err := config.SanitizeCommand(cmdStr)
+	if err != nil {
+		p.proxyLogger.Warnf("<%s> adopt: invalid park.detect command: %v", p.id, err)
+		return false
+	}
+
+	ctx, cancel := context.WithTimeout(p.parentCtx, time.Duration(config.ParkDetectTimeout)*time.Second)
+	defer cancel()
+
+	detectCmd := exec.CommandContext(ctx, args[0], args[1:]...)
+	var stdout bytes.Buffer
+	detectCmd.Stdout = &stdout
+	detectCmd.Stderr = p.processLogger
+	setProcAttributes(detectCmd)
+
+	runErr := detectCmd.Run()
+	if ctx.Err() == context.DeadlineExceeded {
+		p.proxyLogger.Warnf("<%s> adopt: park.detect timed out after %ds, cold-loading instead",
+			p.id, config.ParkDetectTimeout)
+		return false
+	}
+	if runErr != nil {
+		// A detect command that cannot even be started is not "nothing to adopt", it
+		// is a broken declaration: the operator armed adoption and pointed it at a
+		// path that does not exist, so this entry silently keeps paying a cold load
+		// after every gateway restart. Say so at a level the operator will see.
+		if errors.Is(runErr, exec.ErrNotFound) {
+			p.proxyLogger.Warnf("<%s> adopt: park.detect could not be started (%v), adoption is doing nothing and this entry cold-loads after every restart", p.id, runErr)
+			return false
+		}
+		// A failing detect command is the "nothing to adopt" answer. The only cost of
+		// treating it that way is the cold load adoption would have avoided.
+		p.proxyLogger.Debugf("<%s> adopt: park.detect adopted nothing (%v)", p.id, runErr)
+		return false
+	}
+
+	out := bytes.TrimSpace(stdout.Bytes())
+	if len(out) == 0 {
+		return false
+	}
+
+	var adopted struct {
+		Parked bool   `json:"parked"`
+		Proxy  string `json:"proxy"`
+	}
+	if err := json.Unmarshal(out, &adopted); err != nil {
+		brief := string(out)
+		if len(brief) > 200 {
+			brief = brief[:200] + "..."
+		}
+		p.proxyLogger.Warnf("<%s> adopt: park.detect printed neither JSON nor nothing: %s", p.id, brief)
+		return false
+	}
+
+	if !adopted.Parked {
+		p.proxyLogger.Debugf("<%s> adopt: the engine answers awake, leaving it to the normal start path", p.id)
+		return false
+	}
+
+	if adopted.Proxy == "" {
+		p.proxyLogger.Warnf("<%s> adopt: parked engine reported no proxy, refusing to adopt", p.id)
+		return false
+	}
+	target, err := url.Parse(adopted.Proxy)
+	if err != nil || target.Host == "" || (target.Scheme != "http" && target.Scheme != "https") {
+		p.proxyLogger.Warnf("<%s> adopt: %q is not a usable engine URL, refusing to adopt", p.id, adopted.Proxy)
+		return false
+	}
+	if adopted.Proxy != p.config.Proxy {
+		p.proxyLogger.Infof("<%s> adopting the parked engine at %s (this instance would have proxied %s)",
+			p.id, adopted.Proxy, p.config.Proxy)
+	} else {
+		p.proxyLogger.Infof("<%s> adopting the parked engine at %s", p.id, adopted.Proxy)
+	}
+	// p.config is this process's own copy of the model config (a value, not a
+	// pointer into the shared config), so the override is local to the process and
+	// is what every later Proxy read — readiness gate, engineURL, detectUpstream —
+	// sees. The shared config object keeps the configured value.
+	// Remember what to restore. A wake that fails, or a destroy, has to put this
+	// back: every start path builds its proxy target and its readiness gate from
+	// p.config.Proxy, and an adopted address that stops existing would make every
+	// later start fail.
+	p.adoptedProxy = p.config.Proxy
+	p.config.Proxy = adopted.Proxy
+	return true
+}
+
+// restoreAdoptedProxy puts back the proxy startup adoption replaced. No-op for a
+// model that was never adopted. Called when an adopted engine turns out unusable
+// (failed wake) or is deliberately discarded (destroy), i.e. whenever this
+// process is about to cold-start the engine itself through cmd.
+func (p *ProcessCommand) restoreAdoptedProxy() {
+	if p.adoptedProxy == "" {
+		return
+	}
+	p.proxyLogger.Infof("<%s> proxy back to %s, the adopted engine at %s is not being used", p.id, p.adoptedProxy, p.config.Proxy)
+	p.config.Proxy = p.adoptedProxy
+	p.adoptedProxy = ""
+}
+
 // destroyParked runs cmdDestroy for a model that is parked: there is no tracked
 // process to signal, so the command has to name the engine itself. A destroy
 // command that needs ${PID} is refused rather than run against a pid that no
@@ -360,5 +489,10 @@ func (p *ProcessCommand) destroyParked() error {
 		p.processLogger.Warnf("<%s> destroy command exited but a child held its output open; output may be truncated", p.id)
 		runErr = nil
 	}
+	// Whatever the outcome, this process no longer intends to talk to the adopted
+	// engine: after a destroy the next start comes through cmd on the configured
+	// address, and a destroy that failed still means cmd will replace the container
+	// it cannot attach to.
+	p.restoreAdoptedProxy()
 	return runErr
 }

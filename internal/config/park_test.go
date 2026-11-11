@@ -117,6 +117,16 @@ func TestConfig_ParkValidation(t *testing.T) {
 			models: "  a:\n    cmd: sleep 1 --port ${PORT}\n    cmdStop: ctl park\n    cmdDestroy: ctl destroy\n    park:\n      parkedField: status.parked\n",
 			want:   "parkedField must match",
 		},
+		{
+			name:   "park.detect that is only a comment",
+			models: "  a:\n    cmd: sleep 1 --port ${PORT}\n    cmdStop: ctl park\n    cmdDestroy: ctl destroy\n    park:\n      detect: \"# nothing but a note\"\n",
+			want:   "detect: invalid command",
+		},
+		{
+			name:   "park.detect cannot reference ${PID}",
+			models: "  a:\n    cmd: sleep 1 --port ${PORT}\n    cmdStop: ctl park\n    cmdDestroy: ctl destroy\n    park:\n      detect: ctl is-parked ${PID}\n",
+			want:   "${PID} is not available at detection time",
+		},
 	}
 
 	for _, tc := range cases {
@@ -213,4 +223,48 @@ func TestConfig_PinnedPortValidation(t *testing.T) {
 			require.Contains(t, err.Error(), tc.want)
 		})
 	}
+}
+
+// TestConfig_ParkDetectPort: ${PORT} is available to park.detect too, because a
+// detection script has to ask the engine on the port it actually bound — and detect
+// may be the only field in the model that references a port at all.
+func TestConfig_ParkDetectPort(t *testing.T) {
+	cfg, err := LoadConfigFromReader(strings.NewReader(`models:
+  detector:
+    cmd: sleep 1
+    cmdDestroy: ctl destroy detector
+    park:
+      cmd: ctl park detector --port ${PORT}
+      detect: ctl is-parked detector --port ${PORT}
+  other:
+    cmd: sleep 1 --port ${PORT}
+`))
+	require.NoError(t, err)
+
+	detector := cfg.Models["detector"]
+	require.Equal(t, "ctl park detector --port 5800", detector.ParkCommand())
+	require.Equal(t, "ctl is-parked detector --port 5800", detector.DetectCommand())
+	require.Equal(t, 5800, detector.Port)
+	// The auto allocation stepped over the model that only needed the port for its
+	// park fields, and gave the next model the following one.
+	require.Equal(t, 5801, cfg.Models["other"].Port)
+}
+
+// TestConfig_ParkDetectIsDeclaredAboveTheScalar: a `#` note inside a folded
+// park.detect scalar would fold into that scalar's first line and swallow the
+// command (an "empty command" load error, on purpose), so the note goes above the
+// key. This is the shape an operator should write, and ${MODEL_ID} is substituted
+// in park.detect like in every other command field.
+func TestConfig_ParkDetectIsDeclaredAboveTheScalar(t *testing.T) {
+	cfg, err := LoadConfigFromReader(strings.NewReader(`models:
+  a:
+    cmd: sleep 1 --port ${PORT}
+    cmdStop: ctl park a
+    cmdDestroy: ctl destroy a
+    # Ask the engine container whether it is still parked before cold-loading.
+    park:
+      detect: /models/.pcni/park-detect.sh ${MODEL_ID}
+`))
+	require.NoError(t, err)
+	require.Equal(t, "/models/.pcni/park-detect.sh a", cfg.Models["a"].DetectCommand())
 }

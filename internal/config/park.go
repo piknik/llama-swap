@@ -74,7 +74,32 @@ type ParkConfig struct {
 	// WakeEndpoint is POSTed before the readiness gate on the wake path, e.g.
 	// "/v1/wake". Leave it empty for engines that wake on the first request.
 	WakeEndpoint string `yaml:"wakeEndpoint"`
+
+	// Detect asks whether an engine this llama-swap instance does not know about
+	// is already up and parked, before the first start. It is how a container
+	// that survived a gateway restart is adopted instead of cold-replaced:
+	// llama-swap calls no Docker API, so detection is a command, exactly like
+	// cmdStop, and its stdout decides.
+	//
+	// It must print on stdout, within ParkDetectTimeout, either
+	//
+	//	{"parked":true,"proxy":"http://llama-swap_<id>:<port>"}
+	//
+	// to adopt — the proxy is what the readiness gate, the wake endpoint and the
+	// health check then address, which is how a container bound to a port this
+	// instance did not allocate can still be woken — or anything else (empty
+	// stdout, {"parked":false}, a non-zero exit) to leave the model stopped. A
+	// container that answers awake is deliberately NOT adopted: adopting a live
+	// engine as parked would leave llama-swap tracking nothing while a stale
+	// container holds the name, and the next cold run would lose that race.
+	Detect string `yaml:"detect"`
 }
+
+// ParkDetectTimeout bounds, in seconds, how long the detect command may run
+// before adoption is abandoned and the model cold-loads. Detection is a read
+// probe, so a short bound is correct: an engine that cannot answer a parked
+// probe in this window is not worth delaying a request for.
+const ParkDetectTimeout = 5
 
 // Validate rejects impossible park settings and reports the command the model
 // would actually run, so a mis-armed entry fails at config load instead of at
@@ -108,6 +133,18 @@ func (p *ParkConfig) Validate() error {
 
 	if p.WakeEndpoint != "" && !strings.HasPrefix(p.WakeEndpoint, "/") {
 		return fmt.Errorf("wakeEndpoint must start with '/'")
+	}
+
+	if p.Detect != "" {
+		if _, err := SanitizeCommand(p.Detect); err != nil {
+			return fmt.Errorf("detect: invalid command: %w", err)
+		}
+		// Detection runs before this instance has ever started the model, so there
+		// is no process to signal yet. It addresses the engine the way the proxy
+		// does, by host and port.
+		if strings.Contains(p.Detect, "${PID}") {
+			return fmt.Errorf("detect: ${PID} is not available at detection time, this instance has no process for the model yet")
+		}
 	}
 
 	if p.ParkedField != "" {
@@ -182,6 +219,16 @@ func (m ModelConfig) ParkedField() string {
 // a park command and an explicit destroy command.
 func (m ModelConfig) CanPark() bool {
 	return m.Park != nil && m.ParkCommand() != "" && m.CmdDestroy != ""
+}
+
+// DetectCommand returns the command that asks whether an untracked engine is
+// already up and parked, or "" when the model does not declare one. Only models
+// that armed `park:` can be adopted — startup adoption never infers parking.
+func (m ModelConfig) DetectCommand() string {
+	if m.Park == nil {
+		return ""
+	}
+	return m.Park.Detect
 }
 
 // ValidateModelPark checks one model's park declaration. Called for every model

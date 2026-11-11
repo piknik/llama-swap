@@ -580,6 +580,10 @@
                                 "minimum": 0,
                                 "default": 10,
                                 "description": "PCNI fork. Seconds to keep polling statusEndpoint for the parked confirmation after park.cmd has run."
+                            },
+                            "detect": {
+                                "type": "string",
+                                "description": "PCNI fork. Command run once, before this llama-swap instance's first start of the model, that asks whether an engine it does not track is already up and parked. On stdout it must print one JSON object within 5 seconds: {\"parked\":true,\"proxy\":\"http://host:port\"} adopts that engine - the reported proxy is what the readiness gate, the wake endpoint and the proxy then use, which is how a container bound to a port this instance did not allocate can still be woken instead of cold-replaced. Anything else means nothing to adopt, including an engine that answers awake (adopting a live engine would leave llama-swap tracking nothing while a container it cannot stop holds the name). ${PORT} and ${MODEL_ID} are substituted. Without detect, a parked container outliving llama-swap is cold-replaced."
                             }
                         },
                         "additionalProperties": false,

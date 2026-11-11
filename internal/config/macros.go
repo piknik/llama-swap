@@ -188,18 +188,20 @@ func resolveConfigMacros(yamlStr string) (map[string]any, configMacroConfig, err
 		proxy, _ := model["proxy"].(string)
 		cmdStop, _ := model["cmdStop"].(string)
 		cmdDestroy, _ := model["cmdDestroy"].(string)
-		parkCmd := ""
+		parkCmd, parkDetect := "", ""
 		if park, ok := model["park"].(map[string]any); ok {
 			parkCmd, _ = park["cmd"].(string)
+			parkDetect, _ = park["detect"].(string)
 		}
-		// The lifecycle commands may need the port too: parking or destroying a
-		// container addresses the engine by http://<container>:${PORT}. A model that
-		// references ${PORT} only in cmdStop, cmdDestroy or park.cmd still needs a
-		// port allocated.
+		// The lifecycle commands may need the port too: parking, destroying or
+		// adopting a container addresses the engine by http://<container>:${PORT}.
+		// A model that references ${PORT} only in cmdStop, cmdDestroy, park.cmd or
+		// park.detect still needs a port allocated.
 		cmdHasPort := strings.Contains(cmd, "${PORT}") ||
 			strings.Contains(cmdStop, "${PORT}") ||
 			strings.Contains(cmdDestroy, "${PORT}") ||
-			strings.Contains(parkCmd, "${PORT}")
+			strings.Contains(parkCmd, "${PORT}") ||
+			strings.Contains(parkDetect, "${PORT}")
 		proxyHasPort := strings.Contains(proxy, "${PORT}")
 		if cmdHasPort || proxyHasPort {
 			// PORT is available only to models whose command requests an
@@ -257,6 +259,11 @@ func stripRawCommandComments(model map[string]any) {
 			model[field] = StripComments(value)
 		}
 	}
+	// park.cmd / park.detect are deliberately NOT stripped here. YAML folding turns
+	// a `#` note inside one of those scalars into the first line of a single-line
+	// value, so stripping would delete the whole command and silently switch the
+	// verb off. Left unstripped, such a declaration loads with an "empty command"
+	// error instead: a note belongs above the key, like it does for cmd.
 }
 
 // pinnedModelPorts collects each model's `port:` declaration. Pinned ports must
@@ -465,13 +472,19 @@ func validateMacroUses(value any, path, modelID, fieldPath string, allowPID bool
 				continue
 			}
 			if modelID != "" {
+				// ${PID} refers to a process llama-swap started. park.detect runs
+				// before there is one, so it gets its own message rather than the
+				// generic "unknown macro".
+				if fieldPath == "park.detect" && macroName == "PID" {
+					return fmt.Errorf("model %s park.detect: '${PID}' is not available at detection time, this instance has no process for the model yet", modelID)
+				}
 				switch fieldPath {
 				case "cmd", "cmdStop", "proxy", "checkEndpoint", "filters.stripParams", "name", "description":
 					if macroName == "PORT" || macroName == "MODEL_ID" {
 						return fmt.Errorf("macro '${%s}' should have been substituted in %s.%s", macroName, modelID, fieldPath)
 					}
 					return fmt.Errorf("unknown macro '${%s}' found in %s.%s", macroName, modelID, fieldPath)
-				case "park", "park.cmd", "cmdDestroy":
+				case "park", "park.cmd", "park.detect", "cmdDestroy":
 					if macroName == "PORT" || macroName == "MODEL_ID" {
 						return fmt.Errorf("macro '${%s}' should have been substituted in %s.%s", macroName, modelID, fieldPath)
 					}
