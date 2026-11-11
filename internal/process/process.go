@@ -19,6 +19,22 @@ const (
 
 	// process is shutdown and will not be restarted
 	StateShutdown ProcessState = ProcessState("shutdown")
+
+	// StateParked is a model whose engine released its device memory and which
+	// llama-swap no longer tracks as a process, but that keeps its container and
+	// host-side state. It is neither Ready nor Stopped: the next request wakes it
+	// instead of cold-loading it.
+	//
+	// Parked is deliberately not "running": a parked model holds no upstream
+	// handle, so anything that counts it as running would proxy to a process that
+	// is not there.
+	StateParked ProcessState = ProcessState("parked")
+
+	// StateParking is the transient state while a model is drained and its park
+	// command runs. Parking is a multi-second operation (drain, sleep call,
+	// confirmation) and the run loop is single-threaded, so an observer must be
+	// able to tell "being parked" from "stopped".
+	StateParking ProcessState = ProcessState("parking")
 )
 
 // Status is a snapshot of a process's state together with when it became
@@ -35,6 +51,9 @@ type Status struct {
 	// or hint.Unknown before detection finishes or when it failed. Only set
 	// while State is StateReady.
 	Upstream hint.Upstream
+	// ParkedSince is when the process last entered StateParked. It is the zero
+	// time unless State is StateParked, and it is what parkTTL is measured from.
+	ParkedSince time.Time
 }
 
 type Process interface {
@@ -71,6 +90,24 @@ type Process interface {
 	// Stop blocks until the process has terminated. It returns nil when
 	// the process terminated as expected (exit 0)
 	Stop(timeout time.Duration) error
+
+	// Park drains the model's in-flight requests, runs its park command, and
+	// records the model as StateParked: the engine keeps its container and its
+	// host-side state (weights, KV, caches) and releases the device.
+	//
+	//	ready  -> drain, park command, confirm, parked
+	//	else   -> returns an error (nothing to park)
+	//
+	// It returns ErrParkBusy when the model stayed busy — it is left awake and
+	// serving, which is the point of the drain — ErrParkUnconfirmed when the engine
+	// never confirmed parking (the model is recorded stopped), and nil when the
+	// model is parked. drainTimeout of 0 selects the model's parkTimeout.
+	Park(ctx context.Context, drainTimeout time.Duration) error
+
+	// Destroy stops the model outright, running cmdDestroy when the model declares
+	// one and falling back to cmdStop / the process-group kill otherwise. Unlike
+	// Park it leaves nothing resident: the next request cold-loads.
+	Destroy(timeout time.Duration) error
 
 	// State returns the current state of the process
 	// Note: this is a snapshot of the state at the time of the call

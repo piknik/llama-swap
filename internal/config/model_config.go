@@ -143,15 +143,40 @@ type ModelConfig struct {
 	Aliases       []string `yaml:"aliases"`
 	Env           []string `yaml:"env"`
 	CheckEndpoint string   `yaml:"checkEndpoint"`
-	UnloadAfter   int      `yaml:"ttl"`
-	UnloadTimeout int      `yaml:"unloadTimeout"`
-	Unlisted      bool     `yaml:"unlisted"`
-	UseModelName  string   `yaml:"useModelName"`
+
+	// Port pins the value ${PORT} expands to for this model instead of taking the
+	// next automatically allocated port. Pinned ports are reserved before any
+	// allocation, so adding another model cannot renumber this one. A parked
+	// engine keeps listening on the port it was started with, so an entry that may
+	// be parked has to pin it.
+	Port          int    `yaml:"port"`
+	UnloadAfter   int    `yaml:"ttl"`
+	UnloadTimeout int    `yaml:"unloadTimeout"`
+	Unlisted      bool   `yaml:"unlisted"`
+	UseModelName  string `yaml:"useModelName"`
 
 	// Capacities declares resource usage for the capacity router. Missing pools
 	// consume zero; higher EvictCost favors keeping this model resident.
 	Capacities map[string]int64 `yaml:"capacities"`
 	EvictCost  int64            `yaml:"evict_cost"`
+
+	// Park arms park-aware routing for this model: its engine can release the
+	// device and keep its container and host-side state. Declared only — a model
+	// without this block is never parked. With it armed, `ttl` parks the model
+	// instead of unloading it, `/api/models/park` parks it explicitly, and
+	// `/api/models/unload` destroys it with cmdDestroy.
+	//
+	// PCNI fork feature, see docs/kb/guides/model-runtime/parking.md.
+	Park *ParkConfig `yaml:"park"`
+
+	// CmdDestroy destroys the model outright: the engine is gone and the next
+	// request cold-loads. Used by unload and by parkTTL expiry. ${PID} and
+	// ${PORT} are substituted as in cmdStop.
+	CmdDestroy string `yaml:"cmdDestroy"`
+
+	// ParkTTL, in seconds, destroys a model that has stayed parked this long
+	// (0 keeps a parked model parked).
+	ParkTTL int `yaml:"parkTTL"`
 
 	// #179 for /v1/models
 	Name        string `yaml:"name"`

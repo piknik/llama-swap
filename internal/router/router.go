@@ -63,3 +63,28 @@ type LocalRouter interface {
 	// that needed one get that error.
 	SetStartGate(gate func() error)
 }
+
+// Parkable is implemented by a router whose models can be parked and woken.
+//
+// PCNI fork. It is deliberately separate from LocalRouter: a Peer cannot park a
+// model that lives on another machine, and no router parks anything by itself
+// yet — parking comes from a model's ttl or from an operator calling these
+// verbs. Assert for it, do not assume it.
+type Parkable interface {
+	// ParkModel drains the model's in-flight requests and parks it: the engine
+	// keeps its container and host-side state (weights, KV, caches) and releases
+	// the device, so the next request wakes it instead of cold-loading it.
+	//
+	// It returns process.ErrParkBusy when the model stayed busy past its
+	// parkTimeout — the model is left awake and serving, which is the point of the
+	// drain — process.ErrParkUnconfirmed when the engine never confirmed the park
+	// (the model is recorded stopped, not parked), and nil when the model is
+	// parked.
+	ParkModel(modelID string) error
+
+	// UnparkModel wakes a parked model now, through the model's own cmd (which
+	// attaches to the container it still holds) and the normal readiness gate. A
+	// request for the model would wake it anyway; this is for warming a model
+	// before traffic arrives.
+	UnparkModel(modelID string) error
+}

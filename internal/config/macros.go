@@ -153,6 +153,19 @@ func resolveConfigMacros(yamlStr string) (map[string]any, configMacroConfig, err
 	}
 	sort.Strings(modelIDs)
 
+	// A model may pin its own port with `port:`. Pinned ports are reserved before
+	// anything is allocated, so an entry that declares a port keeps it however many
+	// other entries are added later. Auto-allocated ports skip over them.
+	//
+	// Without a pin, PORT is allocated here in sorted model-ID order, which means
+	// adding one entry renumbers every model that sorts after it. That is invisible
+	// for a model that is restarted by the change, and wrong for one that is parked:
+	// a parked engine still listens on the port it was started with.
+	pinnedPorts, err := pinnedModelPorts(models, modelIDs)
+	if err != nil {
+		return nil, configMacroConfig{}, err
+	}
+
 	nextPort := startPort
 	for _, modelID := range modelIDs {
 		model, ok := models[modelID].(map[string]any)
@@ -173,7 +186,20 @@ func resolveConfigMacros(yamlStr string) (map[string]any, configMacroConfig, err
 
 		cmd, _ := model["cmd"].(string)
 		proxy, _ := model["proxy"].(string)
-		cmdHasPort := strings.Contains(cmd, "${PORT}")
+		cmdStop, _ := model["cmdStop"].(string)
+		cmdDestroy, _ := model["cmdDestroy"].(string)
+		parkCmd := ""
+		if park, ok := model["park"].(map[string]any); ok {
+			parkCmd, _ = park["cmd"].(string)
+		}
+		// The lifecycle commands may need the port too: parking or destroying a
+		// container addresses the engine by http://<container>:${PORT}. A model that
+		// references ${PORT} only in cmdStop, cmdDestroy or park.cmd still needs a
+		// port allocated.
+		cmdHasPort := strings.Contains(cmd, "${PORT}") ||
+			strings.Contains(cmdStop, "${PORT}") ||
+			strings.Contains(cmdDestroy, "${PORT}") ||
+			strings.Contains(parkCmd, "${PORT}")
 		proxyHasPort := strings.Contains(proxy, "${PORT}")
 		if cmdHasPort || proxyHasPort {
 			// PORT is available only to models whose command requests an
@@ -183,13 +209,30 @@ func resolveConfigMacros(yamlStr string) (map[string]any, configMacroConfig, err
 				return nil, configMacroConfig{}, fmt.Errorf("model %s: proxy uses ${PORT} but cmd does not - ${PORT} is only available when used in cmd", modelID)
 			}
 
-			portMacro := MacroList{{Name: "PORT", Value: nextPort}}
+			// Decide the port before building the macro: an auto-allocated port must
+			// step over every pinned one, and the macro is what the commands get.
+			port := nextPort
+			allocated := false
+			if pinned, ok := pinnedPorts[modelID]; ok {
+				port = pinned
+			} else {
+				for pinnedPortsContains(pinnedPorts, port) {
+					port++
+				}
+				allocated = true
+			}
+			portMacro := MacroList{{Name: "PORT", Value: port}}
 			resolved = substituteMacroList(model, portMacro)
 			model = resolved.(map[string]any)
 			if err := substituteSetParamsByIDKeys(model, portMacro); err != nil {
 				return nil, configMacroConfig{}, fmt.Errorf("model %s filters.setParamsByID: %w", modelID, err)
 			}
-			nextPort++
+			if allocated && port >= nextPort {
+				nextPort = port + 1
+			}
+			// Record the port the model ended up with, pinned or allocated, so the
+			// decoded config reports the port its cmd and proxy actually name.
+			model["port"] = port
 		}
 
 		if err := validateSetParamsByIDKeys(model, modelID); err != nil {
@@ -209,11 +252,74 @@ func resolveConfigMacros(yamlStr string) (map[string]any, configMacroConfig, err
 }
 
 func stripRawCommandComments(model map[string]any) {
-	for _, field := range []string{"cmd", "cmdStop"} {
+	for _, field := range []string{"cmd", "cmdStop", "cmdDestroy"} {
 		if value, ok := model[field].(string); ok {
 			model[field] = StripComments(value)
 		}
 	}
+}
+
+// pinnedModelPorts collects each model's `port:` declaration. Pinned ports must
+// be valid, unique, and actually used: a model that pins a port has to reference
+// ${PORT} in its cmd, otherwise the pin would be inert while reading as a
+// guarantee.
+func pinnedModelPorts(models map[string]any, modelIDs []string) (map[string]int, error) {
+	pinned := map[string]int{}
+	owner := map[int]string{}
+
+	for _, modelID := range modelIDs {
+		model, ok := models[modelID].(map[string]any)
+		if !ok {
+			continue
+		}
+
+		raw, found := model["port"]
+		if !found || raw == nil {
+			continue
+		}
+
+		var port int
+		switch v := raw.(type) {
+		case int:
+			port = v
+		case int64:
+			port = int(v)
+		case float64:
+			if v != float64(int(v)) {
+				return nil, fmt.Errorf("model %s port must be an integer", modelID)
+			}
+			port = int(v)
+		default:
+			return nil, fmt.Errorf("model %s port must be an integer, got %T", modelID, raw)
+		}
+
+		if port < 1 || port > 65535 {
+			return nil, fmt.Errorf("model %s port must be between 1 and 65535", modelID)
+		}
+
+		cmd, _ := model["cmd"].(string)
+		if !strings.Contains(cmd, "${PORT}") {
+			return nil, fmt.Errorf("model %s port: pinned but cmd does not use ${PORT}", modelID)
+		}
+
+		if other, taken := owner[port]; taken {
+			return nil, fmt.Errorf("model %s port %d is already pinned by model %s", modelID, port, other)
+		}
+
+		pinned[modelID] = port
+		owner[port] = modelID
+	}
+
+	return pinned, nil
+}
+
+func pinnedPortsContains(pinned map[string]int, port int) bool {
+	for _, p := range pinned {
+		if p == port {
+			return true
+		}
+	}
+	return false
 }
 
 func rawStartPort(raw map[string]any) (int, error) {
@@ -339,7 +445,8 @@ func validateConfigMacroUses(raw map[string]any) error {
 				continue
 			}
 			for field, fieldValue := range model {
-				if err := validateMacroUses(fieldValue, "models."+modelID+"."+field, modelID, field, field == "cmdStop"); err != nil {
+				if err := validateMacroUses(fieldValue, "models."+modelID+"."+field, modelID, field,
+					field == "cmdStop" || field == "cmdDestroy" || field == "park"); err != nil {
 					return err
 				}
 			}
@@ -360,6 +467,11 @@ func validateMacroUses(value any, path, modelID, fieldPath string, allowPID bool
 			if modelID != "" {
 				switch fieldPath {
 				case "cmd", "cmdStop", "proxy", "checkEndpoint", "filters.stripParams", "name", "description":
+					if macroName == "PORT" || macroName == "MODEL_ID" {
+						return fmt.Errorf("macro '${%s}' should have been substituted in %s.%s", macroName, modelID, fieldPath)
+					}
+					return fmt.Errorf("unknown macro '${%s}' found in %s.%s", macroName, modelID, fieldPath)
+				case "park", "park.cmd", "cmdDestroy":
 					if macroName == "PORT" || macroName == "MODEL_ID" {
 						return fmt.Errorf("macro '${%s}' should have been substituted in %s.%s", macroName, modelID, fieldPath)
 					}

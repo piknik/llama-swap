@@ -77,6 +77,12 @@ type fakeProcess struct {
 
 	runCalls     atomic.Int32
 	stopCalls    atomic.Int32
+	parkCalls    atomic.Int32
+	destroyCalls atomic.Int32
+	parkErr      error
+	destroyErr   error
+	parkedSince  time.Time
+	parkTimeouts []time.Duration
 	serveCalls   atomic.Int32
 	stopTimeouts []time.Duration
 
@@ -155,7 +161,7 @@ func (f *fakeProcess) markReady() { f.setState(process.StateReady) }
 func (f *fakeProcess) Run(_ time.Duration) error {
 	f.runCalls.Add(1)
 	f.mu.Lock()
-	if f.state != process.StateStopped {
+	if f.state != process.StateStopped && f.state != process.StateParked {
 		s := f.state
 		f.mu.Unlock()
 		return fmt.Errorf("fakeProcess %s: Run called while %s", f.id, s)
@@ -174,6 +180,47 @@ func (f *fakeProcess) Run(_ time.Duration) error {
 	}
 	<-sc
 	return nil
+}
+
+// Park and Destroy satisfy process.Process. The park-aware router behaviour is
+// armed by config, and these tests build configs without park:, so the fake
+// refuses like an unarmed model does. ParkTests set parkErr/destroyErr to drive
+// the parked path.
+func (f *fakeProcess) Park(_ context.Context, _ time.Duration) error {
+	f.mu.Lock()
+	f.parkTimeouts = append(f.parkTimeouts, 0)
+	if f.state != process.StateReady && f.parkErr == nil {
+		s := f.state
+		f.mu.Unlock()
+		return fmt.Errorf("fakeProcess %s: could not be parked in %s state", f.id, s)
+	}
+	if f.parkErr == nil {
+		f.parkedSince = time.Now()
+		f.setStateLocked(process.StateParked)
+	}
+	f.mu.Unlock()
+
+	f.parkCalls.Add(1)
+	if f.parkErr != nil {
+		return f.parkErr
+	}
+	return nil
+}
+
+// Stop on a parked model is a no-op, the way ProcessCommand treats it: stopping
+// is not the verb that discards a parked engine.
+func (f *fakeProcess) stopWhileParked() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.state == process.StateParked
+}
+
+func (f *fakeProcess) Destroy(timeout time.Duration) error {
+	f.destroyCalls.Add(1)
+	if f.destroyErr != nil {
+		return f.destroyErr
+	}
+	return f.Stop(timeout)
 }
 
 func (f *fakeProcess) Stop(timeout time.Duration) error {

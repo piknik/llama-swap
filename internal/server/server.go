@@ -511,6 +511,10 @@ func (s *Server) routes() {
 	// API group (API-key protected) consumed by the UI.
 	mux.Handle("POST /api/models/unload", apiChain.ThenFunc(s.handleAPIUnloadAll))
 	mux.Handle("POST /api/models/unload/{model...}", apiChain.ThenFunc(s.handleAPIUnloadModel))
+	// PCNI fork: explicit park and wake verbs. ttl parks a park-capable model on
+	// its own; unload destroys one; these two are the operator's hands.
+	mux.Handle("POST /api/models/park/{model...}", apiChain.ThenFunc(s.handleAPIParkModel))
+	mux.Handle("POST /api/models/unpark/{model...}", apiChain.ThenFunc(s.handleAPIUnparkModel))
 	mux.Handle("POST /api/models/pause", apiChain.ThenFunc(s.handleAPIPause))
 	mux.Handle("POST /api/models/resume", apiChain.ThenFunc(s.handleAPIResume))
 	mux.Handle("GET /api/profiles", apiChain.ThenFunc(s.handleAPIProfiles))

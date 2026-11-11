@@ -171,6 +171,12 @@ func LoadConfigFromReader(r io.Reader) (Config, error) {
 		if err := validateModelCapacity(modelConfig); err != nil {
 			return Config{}, fmt.Errorf("model %s: %w", modelId, err)
 		}
+		if err := ValidateModelPark(modelId, modelConfig); err != nil {
+			return Config{}, fmt.Errorf("model %s: %w", modelId, err)
+		}
+		if modelConfig.Port < 0 || modelConfig.Port > 65535 {
+			return Config{}, fmt.Errorf("model %s: invalid port value %d", modelId, modelConfig.Port)
+		}
 
 		// Auto-register setParamsByID keys as aliases (skip the model's own ID)
 		for key := range modelConfig.Filters.SetParamsByID {

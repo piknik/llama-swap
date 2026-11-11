@@ -92,6 +92,9 @@ type startReq struct {
 type stopReq struct {
 	timeout time.Duration
 	respond chan error
+	// destroy asks for the model's cmdDestroy (when it declares one) instead of
+	// its stop/park command: an operator unload must not park.
+	destroy bool
 }
 
 type waitReadyReq struct {
@@ -121,6 +124,7 @@ type ProcessCommand struct {
 
 	startCh     chan startReq
 	stopCh      chan stopReq
+	parkCh      chan parkReq
 	waitReadyCh chan waitReadyReq
 
 	// current Status. Written only by run(); read by State() and Status()
@@ -160,6 +164,7 @@ func New(
 
 		startCh:     make(chan startReq),
 		stopCh:      make(chan stopReq),
+		parkCh:      make(chan parkReq),
 		waitReadyCh: make(chan waitReadyReq),
 		waitDelay:   cmdWaitDelay,
 	}
@@ -187,6 +192,24 @@ func (p *ProcessCommand) run() {
 	// p.status mirrors `state` so State() can observe transitions; setState
 	// writes both.
 	state := StateStopped
+
+	// setStateParked is setState for the one state that carries a timestamp of its
+	// own: parkTTL is measured from ParkedSince, and an operator needs to see how
+	// long a model has been holding a container.
+	setStateParked := func(s ProcessState, since time.Time) {
+		old := state
+		state = s
+		p.status.Store(&Status{State: s, ParkedSince: since})
+		if old != s {
+			event.Emit(swaputil.ProcessStateChangeEvent{
+				ProcessName: p.id,
+				OldState:    string(old),
+				NewState:    string(s),
+			})
+		}
+	}
+
+	// helper to update state and notify
 	setState := func(s ProcessState) {
 		old := state
 		state = s
@@ -254,7 +277,10 @@ func (p *ProcessCommand) run() {
 			setState(StateShutdown)
 			if cmd != nil {
 				p.handler.Store(nil)
-				p.killProcess(cmd, cmdCancel, cmdDone, parentCancelGraceTimeout)
+				// Shutdown and config reload destroy. Re-adopting a parked container
+				// across a gateway restart is adoption: separate, tested behaviour, not
+				// a side effect of tearing one down.
+				p.killProcess(cmd, cmdCancel, cmdDone, parentCancelGraceTimeout, true)
 				cmd = nil
 				cmdDone = nil
 				cmdCancel = nil
@@ -320,18 +346,31 @@ func (p *ProcessCommand) run() {
 					continue
 				}
 			}
-			// Only valid from StateStopped. For Run this is also the "second
-			// Run while already running" rejection.
-			if state != StateStopped {
+			// Valid from StateStopped (cold start) or StateParked (wake). A parked
+			// model wakes through the same cmd and readiness gate as a cold start: the
+			// cmd is written to attach when the container is already up, which is
+			// exactly what parking relies on. For Run this is also the "second Run while
+			// already running" rejection.
+			waking := state == StateParked
+			if state != StateStopped && !waking {
 				req.respond <- fmt.Errorf("[%s] could not be started in %s state", p.id, state)
 				continue
+			}
+
+			startTimeout := req.timeout
+			if waking {
+				if wt := p.config.WakeTimeout(); wt > 0 {
+					startTimeout = time.Duration(wt) * time.Second
+				}
+				p.proxyLogger.Infof("<%s> waking parked model", p.id)
+				p.wakeEngine(p.proxyLogger)
 			}
 			setState(StateStarting)
 
 			startCtx, cancelStart := context.WithCancel(context.Background())
 			resultCh := make(chan startResult, 1)
 			go func() {
-				resultCh <- p.doStart(startCtx, req.timeout)
+				resultCh <- p.doStart(startCtx, startTimeout)
 			}()
 
 			// pendingStop holds a Stop request that arrived mid-start, so we
@@ -380,7 +419,21 @@ func (p *ProcessCommand) run() {
 									continue
 								}
 								if time.Since(time.Unix(0, p.lastUse.Load())) > ttlDuration {
-									p.proxyLogger.Infof("<%s> Unloading model, TTL of %ds reached", p.id, p.config.UnloadAfter)
+									if p.config.CanPark() {
+										// ttl parks a park-capable model and destroys the rest.
+										// A busy model is waited out: the ticker keeps ticking
+										// rather than cutting a generation.
+										p.proxyLogger.Infof("<%s> Unloading model, TTL of %ds reached", p.id, p.config.UnloadAfter)
+										err := p.Park(p.parentCtx, 0)
+										switch {
+										case err == nil:
+											return
+										case errors.Is(err, ErrParkBusy):
+											continue
+										default:
+											p.proxyLogger.Warnf("<%s> park failed, stopping instead: %v", p.id, err)
+										}
+									}
 									p.Stop(time.Duration(p.config.UnloadTimeout) * time.Second)
 									return
 								}
@@ -391,6 +444,12 @@ func (p *ProcessCommand) run() {
 					setState(StateStopped)
 					notifyWaiters(res.err)
 					req.respond <- res.err
+					if waking {
+						// A failed wake means the container it parked in is not usable:
+						// record stopped so the next request cold-loads instead of waiting
+						// on a phantom.
+						p.proxyLogger.Warnf("<%s> wake failed, the next request will cold-load: %v", p.id, res.err)
+					}
 				}
 
 			// Stop arrived while doStart was still running. Cancel the
@@ -403,7 +462,8 @@ func (p *ProcessCommand) run() {
 				cancelStart()
 				res := <-resultCh
 				if res.cmd != nil {
-					p.killProcess(res.cmd, res.cancel, res.cmdDone, stop.timeout)
+					// A model that never became ready was never parked: destroy it.
+					p.killProcess(res.cmd, res.cancel, res.cmdDone, stop.timeout, true)
 				}
 				setState(StateStopped)
 				notifyWaiters(ErrStartAborted)
@@ -423,7 +483,7 @@ func (p *ProcessCommand) run() {
 				setState(StateShutdown)
 				res := <-resultCh
 				if res.cmd != nil {
-					p.killProcess(res.cmd, res.cancel, res.cmdDone, parentCancelGraceTimeout)
+					p.killProcess(res.cmd, res.cancel, res.cmdDone, parentCancelGraceTimeout, true)
 				}
 				notifyWaiters(fmt.Errorf("[%s] shutdown", p.id))
 				respondRun(fmt.Errorf("[%s] shutdown", p.id))
@@ -438,10 +498,30 @@ func (p *ProcessCommand) run() {
 
 		// Stop: tear down a running process.
 		case stop := <-p.stopCh:
+			// A parked model has no process to stop, and Stop is not the verb that
+			// discards one: destroying a parked engine is Destroy's job (cmdDestroy).
+			// Evictions and shutdown paths call Stop, and silently marking a parked
+			// model stopped would orphan the container it still holds — llama-swap
+			// would then start a second one and lose the name race.
+			if state == StateParked && !stop.destroy {
+				p.proxyLogger.Debugf("<%s> stop ignored: the model is parked, use destroy to discard it", p.id)
+				stop.respond <- nil
+				continue
+			}
+
 			toreDown := cmd != nil
+			if !toreDown && stop.destroy && state == StateParked {
+				// Destroying a parked model: nothing is tracked, so the destroy
+				// command addresses the engine itself. This is the verb that cleans
+				// up a parked container on purpose (parkTTL, /api/models/unload).
+				if err := p.destroyParked(); err != nil {
+					p.proxyLogger.Warnf("[%s] destroying parked model failed: %v", p.id, err)
+				}
+				toreDown = true
+			}
 			if cmd != nil {
 				setState(StateStopping)
-				p.killProcess(cmd, cmdCancel, cmdDone, stop.timeout)
+				p.killProcess(cmd, cmdCancel, cmdDone, stop.timeout, stop.destroy)
 				cmd = nil
 				cmdDone = nil
 				cmdCancel = nil
@@ -461,6 +541,110 @@ func (p *ProcessCommand) run() {
 			}
 			respondRun(nil)
 			stop.respond <- nil
+
+		// Park: hand the device back and keep the container plus its host-side state.
+		// Handled in the run loop because parking changes the lifecycle state, and the
+		// run loop is the single writer of it.
+		case req := <-p.parkCh:
+			if state != StateReady || cmd == nil {
+				req.respond <- fmt.Errorf("[%s] could not be parked in %s state", p.id, state)
+				continue
+			}
+			if !p.config.CanPark() {
+				req.respond <- fmt.Errorf("[%s] park is not armed for this model", p.id)
+				continue
+			}
+
+			drainTimeout := req.drainTimeout
+			if drainTimeout <= 0 {
+				drainTimeout = time.Duration(p.config.ParkTimeout()) * time.Second
+			}
+
+			// A model with a request in flight is waited out, never cut: parking must
+			// not truncate a generation the way stopping the engine does.
+			setState(StateParking)
+			if !p.waitForIdle(drainTimeout) {
+				p.proxyLogger.Warnf("<%s> park refused after %s: still serving, model stays awake", p.id, drainTimeout)
+				setState(StateReady)
+				req.respond <- ErrParkBusy
+				continue
+			}
+
+			p.proxyLogger.Infof("<%s> parking: %s", p.id, p.parkCommand())
+			if err := p.parkUpstream(cmd); err != nil {
+				p.proxyLogger.Warnf("<%s> park command failed: %v", p.id, err)
+			}
+
+			// Parking means llama-swap releases the process it tracks while the
+			// container stays up. The park command normally does that itself by
+			// releasing the tracked `docker run`/`docker attach` client; if it did not,
+			// release it the gentle way — SIGTERM, never SIGKILL, because llama-swap
+			// must not be the thing that destroys an engine it was asked to park.
+			if !p.awaitClientExit(cmdDone, parkReleaseTimeout) {
+				p.proxyLogger.Debugf("<%s> park: releasing the tracked client", p.id)
+				if err := terminateProcessTree(cmd); err != nil {
+					p.proxyLogger.Debugf("<%s> park: releasing the tracked client failed: %v", p.id, err)
+				}
+				p.awaitClientExit(cmdDone, parkReleaseTimeout)
+			}
+			if cmdCancel != nil {
+				cmdCancel()
+			}
+			cmd = nil
+			cmdDone = nil
+			cmdCancel = nil
+			p.handler.Store(nil)
+
+			parked, parkErr := p.confirmParked()
+			if !parked {
+				// An unconfirmed park is recorded stopped: llama-swap will not claim a
+				// model is holding a container it cannot verify. The next request
+				// cold-loads, or re-attaches if the model's cmd does that.
+				reason := "no confirmation"
+				if parkErr != nil {
+					reason = parkErr.Error()
+				}
+				p.proxyLogger.Warnf("<%s> park not confirmed (%s), recording the model as stopped", p.id, reason)
+				setState(StateStopped)
+				notifyWaiters(fmt.Errorf("[%s] stopped", p.id))
+				respondRun(nil)
+				req.respond <- ErrParkUnconfirmed
+				continue
+			}
+
+			parkedAt := time.Now()
+			setStateParked(StateParked, parkedAt)
+			notifyWaiters(fmt.Errorf("[%s] parked", p.id))
+			respondRun(nil)
+			req.respond <- nil
+			p.proxyLogger.Infof("<%s> parked, the container is kept for the next request", p.id)
+
+			// parkTTL: a parked model that is never woken is destroyed, which is what
+			// hands its host RAM back.
+			if p.config.ParkTTL > 0 {
+				go p.runParkTTL(parkedAt, time.Duration(p.config.ParkTTL)*time.Second)
+			}
+		}
+	}
+}
+
+// runParkTTL destroys a parked model after parkTTL. It exits as soon as the model is
+// no longer parked, so a wake cancels the pending destroy the same way live traffic
+// cancels a ttl unload today.
+func (p *ProcessCommand) runParkTTL(parkedAt time.Time, ttl time.Duration) {
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		if p.State() != StateParked {
+			return
+		}
+		if time.Since(parkedAt) > ttl {
+			p.proxyLogger.Infof("<%s> destroying parked model, parkTTL of %ds reached", p.id, int(ttl/time.Second))
+			if err := p.Destroy(time.Duration(p.config.UnloadTimeout) * time.Second); err != nil {
+				p.proxyLogger.Warnf("<%s> parkTTL destroy failed: %v", p.id, err)
+			}
+			return
 		}
 	}
 }
@@ -537,7 +721,7 @@ func (p *ProcessCommand) doStart(startCtx context.Context, healthCheckTimeout ti
 	cmd.Stderr = p.processLogger
 	cmd.Stdout = p.processLogger
 	cmd.Env = append(cmd.Environ(), p.config.Env...)
-	cmd.Cancel = func() error { return p.sendStopSignal(cmd) }
+	cmd.Cancel = func() error { return p.sendStopSignal(cmd, false) }
 	cmd.WaitDelay = p.waitDelay
 	setProcAttributes(cmd)
 
@@ -570,7 +754,7 @@ func (p *ProcessCommand) doStart(startCtx context.Context, healthCheckTimeout ti
 	}()
 
 	abort := func(err error) startResult {
-		p.killProcess(cmd, cmdCancel, cmdDone, 5*time.Second)
+		p.killProcess(cmd, cmdCancel, cmdDone, 5*time.Second, true)
 		return startResult{err: err}
 	}
 	prematureExit := func() startResult {
@@ -668,19 +852,26 @@ func (p *ProcessCommand) doStart(startCtx context.Context, healthCheckTimeout ti
 	return startResult{cmd: cmd, cmdDone: cmdDone, cancel: cmdCancel, handlerFn: handlerFn}
 }
 
-// sendStopSignal runs the configured CmdStop (if any) or sends SIGTERM to
-// the upstream process. Wired up as cmd.Cancel so it fires whenever the
-// cmd's context is cancelled.
-func (p *ProcessCommand) sendStopSignal(cmd *exec.Cmd) error {
+// sendStopSignal runs the configured CmdStop (if any) or sends SIGTERM to the
+// upstream process. Wired up as cmd.Cancel so it fires whenever the cmd's
+// context is cancelled. destroy selects cmdDestroy over CmdStop: an operator
+// unload destroys, a park does not.
+func (p *ProcessCommand) sendStopSignal(cmd *exec.Cmd, destroy bool) error {
 	if cmd == nil || cmd.Process == nil {
 		p.processLogger.Debugf("<%s> sendStopSignal() called with nil cmd or process, nothing to stop", p.id)
 		return nil
 	}
 	pid := cmd.Process.Pid
-	if p.config.CmdStop != "" {
-		p.processLogger.Debugf("<%s> sendStopSignal() using CmdStop %q for pid %d", p.id, p.config.CmdStop, pid)
+
+	cmdStr := p.config.CmdStop
+	if destroy {
+		cmdStr = p.config.DestroyCommand()
+	}
+
+	if cmdStr != "" {
+		p.processLogger.Debugf("<%s> sendStopSignal() using %q for pid %d", p.id, cmdStr, pid)
 		stopArgs, err := config.SanitizeCommand(
-			strings.ReplaceAll(p.config.CmdStop, "${PID}", fmt.Sprintf("%d", pid)),
+			strings.ReplaceAll(cmdStr, "${PID}", fmt.Sprintf("%d", pid)),
 		)
 		if err == nil {
 			p.processLogger.Debugf("<%s> sendStopSignal() running stop command: %s", p.id, strings.Join(stopArgs, " "))
@@ -707,7 +898,7 @@ func (p *ProcessCommand) sendStopSignal(cmd *exec.Cmd) error {
 			return runErr
 		}
 		// fall through to SIGTERM if sanitize failed
-		p.processLogger.Errorf("<%s> sendStopSignal() failed to sanitize CmdStop %q: %v, falling back to terminateProcessTree", p.id, p.config.CmdStop, err)
+		p.processLogger.Errorf("<%s> sendStopSignal() failed to sanitize %q: %v, falling back to terminateProcessTree", p.id, cmdStr, err)
 	}
 	// On Unix this SIGTERMs the whole process group so a forked grandchild
 	// (e.g. a shell wrapper that backgrounds the real binary) is taken down
@@ -741,7 +932,7 @@ func (p *ProcessCommand) sendStopSignal(cmd *exec.Cmd) error {
 // cancel() is still invoked (deferred) to release the context, but only after
 // the process has exited and os/exec's ctx watcher has already torn down, so it
 // never re-fires cmd.Cancel.
-func (p *ProcessCommand) killProcess(cmd *exec.Cmd, cancel context.CancelFunc, cmdDone <-chan struct{}, gracefulTimeout time.Duration) {
+func (p *ProcessCommand) killProcess(cmd *exec.Cmd, cancel context.CancelFunc, cmdDone <-chan struct{}, gracefulTimeout time.Duration, destroy bool) {
 	if cancel == nil {
 		return
 	}
@@ -753,7 +944,7 @@ func (p *ProcessCommand) killProcess(cmd *exec.Cmd, cancel context.CancelFunc, c
 	if cmd != nil {
 		go func() {
 			p.proxyLogger.Debugf("[%s] sending stop signal with timeout %v", p.id, gracefulTimeout)
-			if err := p.sendStopSignal(cmd); err != nil {
+			if err := p.sendStopSignal(cmd, destroy); err != nil {
 				p.proxyLogger.Warnf("[%s] stop signal failed: %v", p.id, err)
 			}
 		}()

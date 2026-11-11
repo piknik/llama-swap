@@ -539,6 +539,71 @@
                         "default": 0,
                         "description": "Graceful timeout in seconds when unloading this model (manual, API, or TTL expiry) before force-killing it. 0 uses the global unloadTimeout."
                     },
+                    "park": {
+                        "type": "object",
+                        "properties": {
+                            "cmd": {
+                                "type": "string",
+                                "default": "",
+                                "description": "PCNI fork. Command that asks the engine to park itself (release its device memory while keeping the container and its host-side state), e.g. curl -fsS http://127.0.0.1:${PORT}/v1/sleep. It runs only after in-flight requests have drained. ${PORT} and ${MODEL_ID} are substituted. Required, together with cmdDestroy, before a model may park at all: park is opt-in per model."
+                            },
+                            "statusEndpoint": {
+                                "type": "string",
+                                "default": "/health",
+                                "pattern": "^/.*$|^none$",
+                                "description": "PCNI fork. URL path on the engine polled after park.cmd to confirm the model is really parked. 'none' trusts park.cmd alone. If the engine never confirms, the park is recorded as failed and the model is stopped rather than left in a state llama-swap cannot trust."
+                            },
+                            "parkedField": {
+                                "type": "string",
+                                "default": "parked",
+                                "description": "PCNI fork. JSON field in the statusEndpoint response that must be truthy to confirm the park. Engines disagree on this: ninfer answers {\"parked\": true}, basalt answers 200 with plain text, so a basalt entry needs an endpoint that reports it."
+                            },
+                            "wakeEndpoint": {
+                                "type": "string",
+                                "default": "",
+                                "description": "PCNI fork. Optional engine wake route (e.g. /v1/wake) called before the model's cmd re-attaches to the container. Only needed by an engine that will not wake itself when it is attached to."
+                            },
+                            "parkTimeout": {
+                                "type": "integer",
+                                "minimum": 0,
+                                "default": 30,
+                                "description": "PCNI fork. Seconds to wait for in-flight requests to finish before parking. On expiry llama-swap REFUSES the park and leaves the model serving - it does not cut a generation short. 0 parks as soon as the model is idle."
+                            },
+                            "wakeTimeout": {
+                                "type": "integer",
+                                "minimum": 0,
+                                "default": 0,
+                                "description": "PCNI fork. Seconds the wake (re-attaching to the parked container and passing the health check) may take. 0 uses the global healthCheckTimeout."
+                            },
+                            "confirmTimeout": {
+                                "type": "integer",
+                                "minimum": 0,
+                                "default": 10,
+                                "description": "PCNI fork. Seconds to keep polling statusEndpoint for the parked confirmation after park.cmd has run."
+                            }
+                        },
+                        "additionalProperties": false,
+                        "default": {},
+                        "description": "PCNI fork: park settings for this model. A parked model releases its device memory and keeps its container and host-side state, so the next request wakes it in seconds instead of cold-loading it. Declaring park is a request to be parked: it makes ttl park instead of destroy. Nothing parks a model on its own."
+                    },
+                    "cmdDestroy": {
+                        "type": "string",
+                        "default": "",
+                        "description": "PCNI fork. Command that discards this model's engine for good (e.g. docker rm -f llama-swap_${MODEL_ID}). Required when park is declared: parking keeps the container, so without a destroy verb nothing could ever remove it. Used by POST /api/models/unload, by parkTTL, and when a parked model has to be replaced. When the model is parked there is no process to signal, so ${PID} is refused here rather than guessed at."
+                    },
+                    "parkTTL": {
+                        "type": "integer",
+                        "minimum": -1,
+                        "default": -1,
+                        "description": "PCNI fork. Seconds a model may stay parked before it is destroyed with cmdDestroy. -1 uses the global TTL value, 0 disables it (parked until something else destroys the model)."
+                    },
+                    "port": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 65535,
+                        "default": 0,
+                        "description": "PCNI fork. Pin this model to a fixed port instead of taking the next startPort-ordered one. A parked model releases its port allocation, so an unpinned model is given a different port on every wake and can no longer address the container it is keeping - pin the port for any model you park. Duplicate pins are a config error, and the pin has to appear as ${PORT} in cmd."
+                    },
                     "useModelName": {
                         "type": "string",
                         "default": "",

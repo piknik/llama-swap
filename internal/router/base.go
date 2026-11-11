@@ -233,7 +233,13 @@ func (b *baseRouter) GrantServe(req scheduler.HandlerReq, modelID string) bool {
 }
 
 // StopProcesses implements scheduler.Effects, stopping the named processes in
-// parallel and blocking until all have stopped.
+// parallel and blocking until all have stopped. It is reached only from an
+// unload (FIFO.OnUnload) — a swap eviction stops its targets through doSwap.
+//
+// PCNI fork: an unload uses the destroy verb, so a park-capable model that is
+// unloaded on purpose has its container removed too. A model with no cmdDestroy
+// behaves exactly as before: Destroy falls back to cmdStop / the process kill.
+// Parking is what ttl and the park verb do; unloading is what discards.
 func (b *baseRouter) StopProcesses(timeout time.Duration, ids []string) {
 	var wg sync.WaitGroup
 	for _, id := range ids {
@@ -244,12 +250,61 @@ func (b *baseRouter) StopProcesses(timeout time.Duration, ids []string) {
 		wg.Add(1)
 		go func(id string, p process.Process) {
 			defer wg.Done()
-			if err := p.Stop(timeout); err != nil {
+			if err := p.Destroy(timeout); err != nil {
 				b.logger.Warnf("%s: stopping %s failed: %v", b.name, id, err)
 			}
 		}(id, p)
 	}
 	wg.Wait()
+}
+
+// ParkModel parks one model: the engine releases its device memory and keeps its
+// container and host-side state, so the next request wakes it instead of
+// cold-loading it.
+//
+// PCNI fork. Nothing in the router parks a model on its own yet — parking happens
+// because the model's ttl expired, or because an operator called this. A model
+// that is busy past its parkTimeout is left awake and this returns an error.
+func (b *baseRouter) ParkModel(modelID string) error {
+	p, ok := b.processes[modelID]
+	if !ok {
+		return fmt.Errorf("no local process for model %s", modelID)
+	}
+	if mc, configured := b.config.Models[modelID]; !configured || !mc.CanPark() {
+		return fmt.Errorf("model %s does not declare park: (park: and cmdDestroy are both required)", modelID)
+	}
+
+	err := p.Park(b.shutdownCtx, 0)
+	if err == nil {
+		b.logger.Infof("%s: parked %s, container kept", b.name, modelID)
+	}
+	return err
+}
+
+// UnparkModel wakes a parked model now, through the model's own cmd (which
+// attaches to the container it still holds) and the normal readiness gate.
+//
+// PCNI fork: this is the explicit verb. A request for the model wakes it on its
+// own; Unpark is for warming a model up before traffic, or for a UI button.
+func (b *baseRouter) UnparkModel(modelID string) error {
+	p, ok := b.processes[modelID]
+	if !ok {
+		return fmt.Errorf("no local process for model %s", modelID)
+	}
+	if state := p.State(); state != process.StateParked {
+		return fmt.Errorf("model %s is not parked (state %s)", modelID, state)
+	}
+
+	timeout := b.healthCheckTimeout()
+	ctx, cancel := context.WithTimeout(b.shutdownCtx, timeout)
+	defer cancel()
+
+	if err := p.EnsureReady(ctx, timeout); err != nil {
+		return err
+	}
+
+	b.logger.Infof("%s: awoke %s", b.name, modelID)
+	return nil
 }
 
 // trackedServe is the wrapper that closes the loop on in-flight tracking.
@@ -426,6 +481,12 @@ func (b *baseRouter) RunningModels() map[string]process.ProcessState {
 
 // RunningStatus returns the status snapshot of every process that is not
 // stopped or shut down.
+//
+// PCNI fork: that includes StateParked. A parked model holds no upstream handle,
+// but it is resident, and an operator listing models needs to see it. Nothing
+// that serves traffic treats parked as ready: the scheduler asks ModelState, and
+// parked is not ready, so a request for a parked model goes through the swap path
+// and wakes it.
 func (b *baseRouter) RunningStatus() map[string]process.Status {
 	running := make(map[string]process.Status)
 	for id, p := range b.processes {

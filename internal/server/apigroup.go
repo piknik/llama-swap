@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"sort"
@@ -15,6 +16,7 @@ import (
 	"github.com/mostlygeek/llama-swap/internal/logmon"
 	"github.com/mostlygeek/llama-swap/internal/perf"
 	"github.com/mostlygeek/llama-swap/internal/process"
+	"github.com/mostlygeek/llama-swap/internal/router"
 	"github.com/mostlygeek/llama-swap/internal/store"
 	"github.com/mostlygeek/llama-swap/internal/swaputil"
 )
@@ -210,6 +212,78 @@ func (s *Server) handleAPIUnloadModel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.local.Unload(0, realName)
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte("OK"))
+}
+
+// resolveParkableModel resolves the requested model name to a local model and
+// the router that can park it. Parking is a local-engine feature: a peer model,
+// or a router that does not implement it, is refused rather than silently doing
+// nothing.
+func (s *Server) resolveParkableModel(w http.ResponseWriter, r *http.Request) (string, router.Parkable, bool) {
+	requested := strings.TrimPrefix(r.PathValue("model"), "/")
+	realName, found := s.cfg.RealModelName(requested)
+	if !found {
+		swaputil.SendResponse(w, r, http.StatusNotFound, "model not found")
+		return "", nil, false
+	}
+	if !s.local.Handles(realName) {
+		swaputil.SendResponse(w, r, http.StatusNotFound, "no local server found for requested model")
+		return "", nil, false
+	}
+
+	parkable, ok := s.local.(router.Parkable)
+	if !ok {
+		swaputil.SendResponse(w, r, http.StatusNotImplemented, "the active router cannot park models")
+		return "", nil, false
+	}
+
+	return realName, parkable, true
+}
+
+// handleAPIParkModel parks one model. The engine keeps its container and its
+// host-side state and releases the device, so the next request wakes it instead
+// of cold-loading it.
+//
+// 409 is a real answer here, not a failure to fix: it means the model still had
+// requests in flight when its parkTimeout expired, and llama-swap refused to cut
+// them. The model stays awake and serving.
+func (s *Server) handleAPIParkModel(w http.ResponseWriter, r *http.Request) {
+	realName, parkable, ok := s.resolveParkableModel(w, r)
+	if !ok {
+		return
+	}
+
+	if err := parkable.ParkModel(realName); err != nil {
+		switch {
+		case errors.Is(err, process.ErrParkBusy):
+			swaputil.SendResponse(w, r, http.StatusConflict, err.Error())
+		case errors.Is(err, process.ErrParkUnconfirmed):
+			swaputil.SendResponse(w, r, http.StatusBadGateway, err.Error())
+		default:
+			swaputil.SendResponse(w, r, http.StatusBadRequest, err.Error())
+		}
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte("OK"))
+}
+
+// handleAPIUnparkModel wakes a parked model now, through the model's own cmd and
+// the normal readiness gate. Requests for the model wake it on their own; this is
+// for warming a model before traffic arrives.
+func (s *Server) handleAPIUnparkModel(w http.ResponseWriter, r *http.Request) {
+	realName, parkable, ok := s.resolveParkableModel(w, r)
+	if !ok {
+		return
+	}
+
+	if err := parkable.UnparkModel(realName); err != nil {
+		swaputil.SendResponse(w, r, http.StatusConflict, err.Error())
+		return
+	}
+
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte("OK"))
 }
