@@ -611,17 +611,32 @@ func (p *ProcessCommand) run() {
 
 			// Parking means llama-swap releases the process it tracks while the
 			// container stays up. The park command normally does that itself by
-			// releasing the tracked `docker run`/`docker attach` client; if it did not,
-			// release it the gentle way — SIGTERM, never SIGKILL, because llama-swap
-			// must not be the thing that destroys an engine it was asked to park.
-			if !p.awaitClientExit(cmdDone, parkReleaseTimeout) {
-				p.proxyLogger.Debugf("<%s> park: releasing the tracked client", p.id)
-				if err := terminateProcessTree(cmd); err != nil {
+			// releasing the tracked `docker run`/`docker attach` client (the fleet's
+			// entries end their park script with `kill -9 ${PID}` for exactly this).
+			// If it did not, release it here - with SIGKILL, never SIGTERM.
+			//
+			// Measured live on ca4 on 2026-11-11 (`docker events` on the engine
+			// container during a park): a SIGTERM sent to the tracked client arrives
+			// *inside the container* - `docker attach`'s signal proxy forwards it - so a
+			// "gentle" park shuts the engine down and destroys the container parking is
+			// supposed to keep (the sim logged `SIGNAL 15` twice, 15 s apart, one per
+			// SIGTERM cycle). SIGKILL cannot be proxied or caught, and killing the
+			// attached `docker run`/`docker attach` client does not stop the container
+			// (measured repeatedly in the fleet's sleep-stop work). So the only safe
+			// release is the abrupt one.
+			if !p.awaitClientExit(cmdDone, parkReleaseGrace) {
+				p.proxyLogger.Debugf("<%s> park: releasing the tracked client with SIGKILL (SIGTERM would reach the container through the attach proxy)", p.id)
+				if err := killProcessTree(cmd); err != nil {
 					p.proxyLogger.Debugf("<%s> park: releasing the tracked client failed: %v", p.id, err)
 				}
-				p.awaitClientExit(cmdDone, parkReleaseTimeout)
+				p.awaitClientExit(cmdDone, parkKillTimeout)
 			}
+			// Neutralise the stop verb on this context before releasing it: exec runs
+			// cmd.Cancel on context cancellation, and cmd.Cancel is sendStopSignal ->
+			// CmdStop. A parked model must not be reachable by the stop verb any more
+			// (that command addresses the container, and parking kept it on purpose).
 			if cmdCancel != nil {
+				cmd.Cancel = func() error { return nil }
 				cmdCancel()
 			}
 			cmd = nil

@@ -888,3 +888,77 @@ func TestProcessCommand_AdoptedProxyIsRestoredOnDestroy(t *testing.T) {
 		t.Errorf("proxied /health after destroy: got %d %q, want 200 ok from the configured engine", code, body)
 	}
 }
+
+// TestProcessCommand_ParkReleasesTheClientWithSIGKILL pins the live finding from
+// 2026-11-11. Parking had been releasing the tracked client "gently" with SIGTERM
+// (terminateProcessTree). Measured on ca4 against a scratch model whose cmd is
+// `docker attach`, `docker events` on the engine container showed
+// `container kill ... signal=15` twice, 15 s apart - i.e. the SIGTERM intended for
+// the client was proxied *into the container*, and a real engine (basalt's serve
+// parent, ninfer) honours SIGTERM, so the park would have shut the engine down and
+// left llama-swap reporting a parked model whose container is gone. Parking must
+// therefore never send a forwardable signal, and it must not run CmdStop either,
+// because that command addresses the container parking is supposed to keep.
+func TestProcessCommand_ParkReleasesTheClientWithSIGKILL(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("park tests drive POSIX shell commands")
+	}
+
+	e := newParkTestEngine(t)
+	dir := t.TempDir()
+	termMark := filepath.Join(dir, "term-received")
+	stopMark := filepath.Join(dir, "cmdstop-ran")
+
+	conf := parkTestConfig(t, e)
+	// The tracked client traps SIGTERM and records it. Parking releases it with
+	// SIGKILL, which cannot be trapped or proxied, so the marker must never appear.
+	conf.Cmd = fmt.Sprintf("sh -c 'trap \"touch %s; exit\" TERM; sleep 120'", termMark)
+	conf.CmdStop = fmt.Sprintf("sh -c \"touch %s\"", stopMark)
+	// A park command that parks the engine but leaves the client attached: llama-swap
+	// has to release the client itself, which is the path under test.
+	conf.Park.Cmd = fmt.Sprintf("sh -c \"touch %s\"", e.parkedFile())
+
+	p := newProcessCommand(t, conf)
+	runAsync(t, p)
+	defer func() {
+		if p.State() == StateParked {
+			p.Destroy(testStopTimeout)
+		}
+	}()
+
+	start := time.Now()
+	if err := p.Park(context.Background(), 0); err != nil {
+		t.Fatalf("Park: expected nil, got %v", err)
+	}
+	elapsed := time.Since(start)
+	waitForState(t, p, StateParked)
+
+	if _, err := os.Stat(termMark); err == nil {
+		t.Error("parking sent SIGTERM to the tracked client: docker's attach signal proxy forwards it into the container, so parking must release with SIGKILL")
+	}
+	if _, err := os.Stat(stopMark); err == nil {
+		t.Error("CmdStop ran during Park: parking must not run the stop verb, that command would take the parked container down")
+	}
+	if !e.isParked() {
+		t.Error("engine was never parked: park command did not run")
+	}
+	if !engineIsUp(t, e) {
+		t.Error("engine stopped serving after Park: parking must not destroy it")
+	}
+	// The old path waited two 15 s timeouts (30 s) before parking anything. A park
+	// must be quick enough to be usable inside an eviction.
+	if elapsed > 8*time.Second {
+		t.Errorf("Park took %s: releasing the tracked client must not wait out long timeouts", elapsed)
+	}
+
+	// Destroying the parked model runs cmdDestroy and still must never run cmdStop.
+	if err := p.Destroy(testStopTimeout); err != nil {
+		t.Fatalf("Destroy on parked model: %v", err)
+	}
+	if _, err := os.Stat(stopMark); err == nil {
+		t.Error("CmdStop ran while destroying a parked model: only cmdDestroy may run")
+	}
+	if !readMarker(e.destroyedFile()) {
+		t.Error("cmdDestroy did not run: a parked model destroyed on purpose must be discarded, not left holding a container")
+	}
+}

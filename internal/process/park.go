@@ -16,14 +16,19 @@ import (
 	"github.com/mostlygeek/llama-swap/internal/logmon"
 )
 
-// Parking bounds. The release bound covers a park command that parks the engine
-// but leaves the tracked client attached (the `docker run`/`docker attach` client
-// llama-swap is waiting on); the confirm bound is how long llama-swap polls the
-// engine's status endpoint before concluding the model was destroyed rather than
-// parked.
+// Parking bounds. `parkReleaseGrace` is how long llama-swap waits for the park
+// command to release the tracked `docker run`/`docker attach` client itself (the
+// fleet's entries do this with `kill -9 ${PID}`) before llama-swap releases it
+// with SIGKILL. SIGTERM is deliberately not used: docker's attach signal proxy
+// forwards it into the container, so a graceful park would shut down the engine
+// container parking is meant to preserve (measured 2026-11-11 via docker events).
+// `parkKillTimeout` bounds the wait for that release to take effect; the confirm
+// bound is how long llama-swap polls the engine's status endpoint before
+// concluding the model was destroyed rather than parked.
 const (
-	parkReleaseTimeout = 15 * time.Second
-	parkPollInterval   = 200 * time.Millisecond
+	parkReleaseGrace = 2 * time.Second
+	parkKillTimeout  = 5 * time.Second
+	parkPollInterval = 200 * time.Millisecond
 )
 
 // ErrParkBusy reports that a park was refused because the model still had
